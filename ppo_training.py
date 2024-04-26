@@ -34,11 +34,11 @@ from tqdm import tqdm
 from transformers import HfArgumentParser
 
 from mlx.utils import tree_flatten
-from custom_ppo_trainer import PPOTrainer
+from mlx_ppo_trainer import PPOTrainer
 from data.digit_seq_rewards import RewardFunction
 import utils
 
-from config import PPOConfig
+from models.config import PPOConfig
 from models.prompt_tuning import PromptTuning
 from models.lora import LoRALinear
 

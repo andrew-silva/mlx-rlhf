@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import copy
 import math
 import time
 import typing
@@ -38,10 +37,8 @@ from transformers import (
 )
 
 from utils import RunningMoments, stats_to_np, set_seed, generate_ids, \
-    masked_whiten, masked_mean, masked_var, clip_by_value, replace_nans_get_means, \
-    entropy_from_logits, logprobs_from_logits, flatten_dict, extract_grads, \
-    convert_to_scalar, stack_dicts, AdaptiveKLController, FixedKLController
-from config import PPOConfig
+    masked_whiten, masked_mean, logprobs_from_logits, flatten_dict, convert_to_scalar, stack_dicts, AdaptiveKLController, FixedKLController
+from models.config import PPOConfig
 
 EPS = 1e-6
 
