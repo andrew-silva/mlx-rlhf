@@ -19,7 +19,7 @@ However, the example is intended to be general should you wish to use a custom d
   * [Supervised Fine-tuning (SFT)](#Supervised-Fine-tuning)
   * [Learning a Reward Model](#Learning-a-Reward-Model)
   * [Fusing](#Fuse-and-Upload)
-  * [Reinforcement Learning (RLHF)](#Reinforcement-Learning-(RLHF))
+  * [Reinforcement Learning (RLHF)](#Reinforcement-Learning-RLHF)
 * [Results](#Results)
 * [Custom Data](#Custom-Data)
 
