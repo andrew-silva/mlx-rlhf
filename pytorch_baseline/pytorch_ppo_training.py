@@ -15,33 +15,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Example call to use a pre-trained soft-prompt model from sft.py for RLHF with ground-truth reward:
-python ppo_training.py --log_with=wandb --prompt_tuning --resume_file prompt_weights.npz --num_prompt_tokens 10 --model ../tiny_llama --ground_truth_reward
-
 Example call to use a pre-trained LoRA from sft for RLHF with ground-truth reward:
-python ppo_training.py --log_with=wandb --resume_file lora_weights.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --ground_truth_reward
-
-Example call to try LoRA without SFT for RLHF with a learned reward model (located at `../reward_model`):
-python ppo_training.py --log_with=wandb --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --reward_model ../reward_model/
+python ppo_training.py --log_with=wandb --resume_file pytorch_model --ground_truth_reward
 """
 from dataclasses import dataclass, field
 from typing import Optional
 import random
 
-import mlx.core as mx
+import torch
 import numpy as np
 from tqdm import tqdm
-from transformers import HfArgumentParser
+from transformers import HfArgumentParser, AutoModel, AutoTokenizer, AutoModelForCausalLM
 
-from mlx.utils import tree_flatten
-from mlx_ppo_trainer import PPOTrainer
+from pytorch_ppo_trainer import PPOTrainer
 from data.digit_seq_rewards import RewardFunction
-import utils
 
 from models.config import PPOConfig
-from models.prompt_tuning import PromptTuning
-from models.lora import LoRALinear
-
+from peft import LoraConfig, get_peft_model
 
 def collator(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
@@ -49,38 +39,40 @@ def collator(data):
 
 def main(args_in, ppo_config_in):
     # set seed before initializing value head for deterministic eval
-    utils.set_seed(ppo_config_in.seed)
+    random.seed(ppo_config_in.seed)
+    np.random.seed(ppo_config_in.seed)
+    torch.random.manual_seed(ppo_config_in.seed)
 
     # Now let's build the model, the reference model, and the tokenizer.
     # TODO: Actually handle the use_peft parameter
     if not args_in.use_peft:
-        ref_model, _, _ = utils.load(args_in.model)
+        if args_in.resume_file:
+            ref_model = AutoModel.from_pretrained(args_in.resume_file)
+        else:
+            ref_model = AutoModelForCausalLM.from_pretrained(args_in.model)
         device_map = None
         peft_config = None
     else:
         ref_model = None
 
-    model, tokenizer, _ = utils.load(args_in.model)
-    model.freeze()
-    model.v_head.unfreeze()
-    if args_in.prompt_tuning:
-        model = PromptTuning(num_tokens=args_in.num_prompt_tokens, model=model)
+    if args_in.resume_file:
+        model = AutoModel.from_pretrained(args_in.resume_file)
     else:
-        for l in model.model.layers[len(model.model.layers) - args_in.lora_layers:]:
-            l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
-            l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
-            if hasattr(l, "block_sparse_moe"):
-                l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
+        model = AutoModelForCausalLM.from_pretrained(args_in.model)
 
-    if args_in.resume_file is not None:
-        print(f"Loading pretrained prompts from {args_in.resume_file}")
-        model.load_weights(args_in.resume_file, strict=False)
+    tokenizer = AutoTokenizer.from_pretrained(args_in.model)
 
-    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
-    print(f"Total parameters {p:.3f}M")
-    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10 ** 6
-    print(f"Trainable parameters {p:.3f}M")
+    config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.01,
+    )
+    model = get_peft_model(model, config)
 
+    model.value_head = torch.nn.Linear(model.config.hidden_size, 1)
+    ref_model.value_head = torch.nn.Linear(ref_model.config.hidden_size, 1)
     # Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -94,7 +86,7 @@ def main(args_in, ppo_config_in):
         #  (especially if we need to match sft.py)
         reward_function = RewardFunction(is_increasing=True, multiple_of=2)
     else:
-        reward_function, reward_tokenizer, _ = utils.load(args_in.reward_model_dir)
+        reward_function = AutoModel.from_pretrained(args_in.reward_model_dir)
 
     # We then define the arguments to pass to the `generate` function. These arguments
     # are passed to the `generate` function of the PPOTrainer, which is a wrapper around
@@ -121,7 +113,7 @@ def main(args_in, ppo_config_in):
             'query': [text_in],
             # 'input_ids': mx.array(tokenizer.encode(text_in))
         }
-        query_tensors = mx.array(tokenizer.encode(text_in))  # batch["input_ids"]
+        query_tensors = tokenizer.encode(text_in, return_tensors="pt")  # batch["input_ids"]
 
         # Get response from gpt2
         response_tensors, ref_response_tensors = ppo_trainer.generate(
@@ -130,8 +122,8 @@ def main(args_in, ppo_config_in):
 
         batch["response"] = tokenizer.batch_decode(np.array(response_tensors))
         batch["ref_response"] = tokenizer.batch_decode(np.array(ref_response_tensors))
-        response_tensors = [response_tensors[0]]
-        ref_response_tensors = [ref_response_tensors[0]]
+        response_tensors = [response_tensors]
+        ref_response_tensors = [ref_response_tensors]
 
         # Compute sentiment score
         # texts = [q + r for q, r in zip(batch["query"], batch["response"])]
@@ -140,17 +132,17 @@ def main(args_in, ppo_config_in):
             scores = reward_function(batch['response'])  # Should we omit query in the scoring?
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
         else:
-            scored_tensors = mx.array(reward_tokenizer.encode(batch["response"][0]))[None, :]
-            _, _, scores = reward_function(mx.array(response_tensors))
+            scored_tensors = tokenizer.encode(batch["response"][0], return_tensors="pt").unsqueeze(0)
+            _, _, scores = reward_function(response_tensors)
             scores = scores[:, -1].item()
-        rewards = [mx.array(scores)]
+        rewards = [torch.tensor(scores)]
 
         ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
         if args_in.ground_truth_reward:
             ref_scores = reward_function(batch['ref_response'])
         else:
-            scored_tensors = mx.array(reward_tokenizer.encode(batch["ref_response"][0]))[None, :]
-            _, _, ref_scores = reward_function(mx.array(ref_response_tensors))
+            scored_tensors = tokenizer.encode(batch["ref_response"][0], return_tensors="pt").unsqueeze(0)
+            _, _, ref_scores = reward_function(ref_response_tensors)
             ref_scores = [ref_scores[:, -1].item()]
 
         batch["ref_rewards"] = ref_scores
@@ -160,8 +152,7 @@ def main(args_in, ppo_config_in):
         ppo_trainer.log_stats(stats, batch, rewards,
                               columns_to_log=["query", "response", "ref_response", "ref_rewards"])
     # Save prompt weights
-    mx.savez(args_in.save_file, **dict(tree_flatten(model.trainable_parameters())))
-
+    model.save_pretrained(args_in.save_file)
 
 if __name__ == "__main__":
     tqdm.pandas()
@@ -188,7 +179,7 @@ if __name__ == "__main__":
 
     parser = HfArgumentParser((ScriptArguments, PPOConfig))
     args, ppo_config = parser.parse_args_into_dataclasses()
-    # TODO: Adaptive KL seems to break things... Why? Over/underflow? Type issues?
+    # TODO: Adaptive KL seems to break things... Why? Over/underflow?
     ppo_config.adap_kl_ctrl = False
 
     # We then define the arguments to pass to the sentiment analysis pipeline.

@@ -3,34 +3,24 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
-import json
-import math
 import time
-import random
-from pathlib import Path
 from data.data_utils import load_datasets
+
 import matplotlib.pyplot as plt
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import utils
-from mlx.utils import tree_flatten
-import datasets
-from models.prompt_tuning import PromptTuning
-from models.lora import LoRALinear
-
+import torch
+from peft import LoraConfig, get_peft_model
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 """
-Example command for supervised fine-tuning with soft-prompts on generated data with a locally saved tiny llama:
-python sft.py --prompt-tuning --save-file prompt_weights.npz --data-base increasing_mult_2_ --model ../tiny_llama --train
-
 Example command for supervised fine-tuning with LoRA on generated data with a HF tiny llama
-python sft.py --save-file lora_weights.npz --data-base increasing_mult_2_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train
+python pytorch_sft.py --save-file lora_weights.npz --data-base increasing_mult_2_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train
 
 Example command for training a reward model with LoRA on generated data with a HF tiny llama
-python sft.py --reward-model --train --data-base reward_function_increasing_mult_2_ --batch-size 16 --save-file reward_lora.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+python pytorch_sft.py --reward-model --train --data-base reward_function_increasing_mult_2_ --batch-size 16 --save-file reward_lora.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 """
 
 
@@ -38,7 +28,7 @@ def build_parser():
     arg_parse = argparse.ArgumentParser(description="Soft Prompt finetuning.")
     arg_parse.add_argument(
         "--model",
-        default="mlx_model",
+        default="model",
         help="The path to the local model directory or Hugging Face repo.",
     )
     # Generation args
@@ -158,26 +148,6 @@ def build_parser():
     return arg_parse
 
 
-def loss(mdl, inputs, targets, lengths):
-    """
-    SFT loss, standard language modeling cross-entropy loss
-    Returns:
-        Loss value, tokens-per-second
-    """
-    # Run model on inputs
-    logits, _, _ = mdl(inputs)
-    logits = logits.astype(mx.float32)
-
-    # Mask padding tokens
-    length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
-
-    # Calculate the loss
-    ce = nn.losses.cross_entropy(logits, targets) * length_mask
-    ntoks = length_mask.sum()
-    ce = ce.sum() / ntoks
-    return ce, ntoks
-
-
 def reward_loss(mdl, better_inputs, worse_inputs):
     """
     Reward modeling loss, maximizing the difference between the preferred sequence and the "dispreferred" sequence
@@ -189,8 +159,8 @@ def reward_loss(mdl, better_inputs, worse_inputs):
     _, _, rewards_j = mdl(better_inputs)
     _, _, rewards_k = mdl(worse_inputs)
     # Batch x SeqLen x OutputDim -- get last token value
-    diff_val = -mx.log(mx.sigmoid(rewards_j[:, -1, :] - rewards_k[:, -1, :])).mean()
-    return diff_val, mx.array(0)  # TODO: this is telling the logger "0 toks per sec"
+    diff_val = -torch.nn.functional.logsigmoid(rewards_j[:, -1, :] - rewards_k[:, -1, :]).mean()
+    return diff_val, torch.tensor([0])  # TODO: this is telling the logger "0 toks per sec"
 
 
 def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=False):
@@ -221,8 +191,8 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                 for j in range(batch_size):
                     p_arr[j, : p_lengths[j]] = pref_batch[j]
                     b_arr[j, : b_lengths[j]] = bad_batch[j]
-                pref_batch = mx.array(p_arr)
-                bad_batch = mx.array(b_arr)
+                pref_batch = torch.tensor(p_arr)
+                bad_batch = torch.tensor(b_arr)
                 yield pref_batch, bad_batch
             else:
                 batch = [tok.encode(dset[indices[i + j]]) for j in range(batch_size)]
@@ -233,38 +203,41 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                     print(len_warning_message)
 
                 # Pad to the max length
-                batch_arr = np.zeros((batch_size, max(lengths)), np.int32)
-
+                batch_arr = np.ones((batch_size, max(lengths)), np.int32) * -100
                 for j in range(batch_size):
                     batch_arr[j, : lengths[j]] = batch[j]
-                batch = mx.array(batch_arr)
-                yield batch[:, :-1], batch[:, 1:], mx.array(lengths)
+                batch = torch.tensor(batch_arr)
+                input_ids = batch.clone()
+                input_ids[input_ids == -100] = tok.pad_token_id
+                labels = batch.clone()
+                yield input_ids, labels
 
         if not train_mode:
             break
 
 
-def evaluate(mdl, dataset, loss_fn, tok, train_args):
+def evaluate(mdl, dataset, tok, train_args, device='mps'):
     all_losses = []
     ntokens = 0
+    mdl.to(device)
     for it, batch in zip(
         range(train_args.val_batches),
         iterate_batches(dataset, tok, train_args.batch_size, reward_modeling=train_args.reward_model),
     ):
-        losses, toks = loss_fn(mdl, *batch)
-        all_losses.append((losses * toks).item())
-        ntokens += toks.item()
+        input_ids = batch[0].to(device)
+        targets = batch[1].to(dtype=torch.long, device=device)
+        output = mdl(input_ids=input_ids, labels=targets)
+        all_losses.append(output.loss.item())
 
     return np.sum(all_losses) / max(ntokens, train_args.val_batches)
 
 
-def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
+def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
     # Create value and grad function for loss
-    loss_value_and_grad = nn.value_and_grad(mdl, loss_fn)
-
     losses = []
     val_losses = []
     n_tokens = 0
+    mdl.to(device)
 
     # Main training loop
     start = time.perf_counter()
@@ -273,17 +246,15 @@ def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
         iterate_batches(train_ds, tok, train_args.batch_size,
                         train_mode=True, reward_modeling=train_args.reward_model),
     ):
-
         # Forward and backward pass
-        (lvalue, toks), grad = loss_value_and_grad(mdl, *batch)
-
-        # Model update
-        optimizer.update(mdl, grad)
-        mx.eval(mdl.parameters(), optimizer.state, lvalue)
-
+        input_ids = batch[0].to(device)
+        targets = batch[1].to(dtype=torch.long, device=device)
+        output = mdl(input_ids=input_ids, labels=targets)
+        output.loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
         # Record loss
-        losses.append(lvalue.item())
-        n_tokens += toks.item()
+        losses.append(output.loss.item())
 
         # Report training loss if needed
         if (it + 1) % train_args.steps_per_report == 0:
@@ -302,7 +273,7 @@ def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
         if (it == 0 or (it + 1) % train_args.steps_per_eval == 0) and val_set is not None:
             stop = time.perf_counter()
             val_loss = evaluate(
-                mdl, val_set, loss_fn, tok, train_args
+                mdl, val_set, tok, train_args
             )
             print(
                 f"Iter {it + 1}: "
@@ -312,13 +283,6 @@ def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
             val_losses.append(val_loss)
 
             start = time.perf_counter()
-
-        # Save prompt weights if needed
-        if (it + 1) % train_args.save_every == 0:
-            mx.savez(
-                train_args.save_file, **dict(tree_flatten(mdl.trainable_parameters()))
-            )
-            print(f"Iter {it + 1}: Saved PEFT weights to {train_args.save_file}.")
     fn = ''
     if train_args.prompt_tuning:
         fn += 'prompt_tuning_'
@@ -337,66 +301,36 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
 
     print("Loading pretrained model")
-    model, tokenizer, _ = utils.load(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model)
 
-    # Freeze all layers other than PEFT weights
-    # TODO: model.freeze() is probably freezing my value head, which I need for reward modeling >.<
-    model.freeze()
-    model.v_head.unfreeze()
-    if args.prompt_tuning:
-        model = PromptTuning(num_tokens=args.num_prompt_tokens, model=model)
-    else:
-        for l in model.model.layers[len(model.model.layers) - args.lora_layers:]:
-            l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
-            l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
-            if hasattr(l, "block_sparse_moe"):
-                l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
-
-    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10**6
-    print(f"Total parameters {p:.3f}M")
-    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
-    print(f"Trainable parameters {p:.3f}M")
+    config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.01,
+    )
+    model = get_peft_model(model, config)
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_datasets(args)
 
+    # Resume training the given weights.
+    if args.resume_file is not None:
+        print(f"Loading pretrained weights from {args.resume_file}")
+        model.load_weights(args.resume_file, strict=False)
+
     if args.reward_model:
         loss_function = reward_loss
-    else:
-        loss_function = loss
 
     if args.train:
         print("Training")
-        opt = optim.Adam(learning_rate=args.learning_rate)
+        opt = optim.Adam(model.parameters(), lr=args.learning_rate)
 
         # Train model
-        train(model, train_set, valid_set, opt, loss_function, tokenizer, args)
+        train(model, train_set, valid_set, opt, tokenizer, args)
 
-        # Save weights
-        mx.savez(args.save_file, **dict(tree_flatten(model.trainable_parameters())))
-
-    # Load the weights which we assume should exist by this point
-    if not Path(args.save_file).is_file():
-        raise ValueError(
-            f"Save file {args.save_file} missing. "
-            "Use --train to learn and save the prompts.npz."
-        )
-    model.load_weights(args.save_file, strict=False)
-
-    if args.test and test_set is not None:
-        print("Testing")
-        model.eval()
-        test_loss = evaluate(
-            model,
-            test_set,
-            loss,
-            tokenizer,
-            args
-        )
-        test_ppl = math.exp(test_loss)
-
-        print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
-
-    if args.prompt is not None:
-        print("Generating")
-        utils.generate(model, args.prompt, tokenizer, args)
+        # Save model
+        model.merge_and_unload()
+        model.save_pretrained(args.save_file)

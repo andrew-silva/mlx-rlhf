@@ -21,13 +21,11 @@ from contextlib import nullcontext
 from typing import Callable, List, Optional, Union
 import wandb
 
-import mlx.core
-import numpy as np
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
+import torch.optim as optim
+import torch.nn as nn
+import torch
 
-from models.base import create_reference_model
+import numpy as np
 
 from transformers import (
     DataCollatorForLanguageModeling,
@@ -91,6 +89,7 @@ class PPOTrainer:
             optimizer: Optional[optim.Optimizer] = None,
             data_collator: Optional[typing.Callable] = None,
             num_shared_layers: Optional[int] = None,
+            device='mps',
     ):
         """
         Initialize PPOTrainer.
@@ -111,10 +110,12 @@ class PPOTrainer:
             num_shared_layers (Optional[int]):
                 Number of shared layers between the model and the reference model. If `None`, all layers are shared.
                 used only if `ref_model` is `None`.
+            device: device to cast everything onto (default mps)
         """
         self.config = config
         # initial seed for reproducible experiments
         set_seed(config.seed)
+        self.device = device
 
         # Step 0: check positional arguments validity
         if not isinstance(config, PPOConfig):
@@ -142,7 +143,8 @@ class PPOTrainer:
                     UserWarning,
                 )
         elif ref_model is None and not self.is_peft_model:
-            self.ref_model = create_reference_model(self.model, num_shared_layers=num_shared_layers)
+            raise ValueError("Pass me a reference model please.")
+            # self.ref_model = create_reference_model(self.model, num_shared_layers=num_shared_layers)
         elif self.is_peft_model:
             self.ref_model = None
 
@@ -166,9 +168,9 @@ class PPOTrainer:
         else:
             self.data_collator = data_collator
         if optimizer is None:
-            self.optimizer = optim.Adam(
-                learning_rate=self.config.learning_rate,
-            )
+            self.optimizer = optim.Adam(self.model.parameters(),
+                                        lr=self.config.learning_rate,
+                                        )
         else:
             self.optimizer = optimizer
 
@@ -182,7 +184,7 @@ class PPOTrainer:
 
         # post process for PP
         if not getattr(self.model, "is_sequential_parallel", False):
-            self.current_device = mlx.core.Device
+            self.current_device = torch.device(self.device)
 
         self.running = RunningMoments()
         self.logger = wandb.init(
@@ -190,11 +192,10 @@ class PPOTrainer:
             config=config,
             save_code=True
         )
-        self.loss_value_and_grad = nn.value_and_grad(self.model, self.loss_fn)
 
     def generate(
             self,
-            query_tensor: Union[mx.array, List[mx.array]],
+            query_tensor: Union[torch.Tensor, List[torch.Tensor]],
             length_sampler: Callable = None,
             batch_size: int = 4,
             return_prompt: bool = True,
@@ -245,15 +246,10 @@ class PPOTrainer:
                     )
 
         else:
-            if len(query_tensor.shape) == 2:
-                raise ValueError(
-                    "query_tensor must be a tensor of shape (`seq_len`) or a list of tensors of shape (`seq_len`)"
-                )
-
             if length_sampler is not None:
                 generation_kwargs["max_new_tokens"] = length_sampler()
             response = generate_ids(model=self.model,
-                                    input_ids=query_tensor[None, :],
+                                    input_ids=query_tensor,
                                     eos_token_id=self.tokenizer.eos_token_id,
                                     temperature=0.0,
                                     max_tokens=generation_kwargs['max_new_tokens'])
@@ -261,16 +257,11 @@ class PPOTrainer:
                 with self.optional_peft_ctx():
                     ref_response = generate_ids(
                         model=ref_model,
-                        input_ids=query_tensor[None, :],
+                        input_ids=query_tensor,
                         eos_token_id=self.tokenizer.eos_token_id,
                         temperature=0.0,
                         max_tokens=generation_kwargs['max_new_tokens']
                     )
-
-            # if not return_prompt and not self.is_encoder_decoder:
-            #     response = response[:, query_tensor.shape[0]:]
-            #     if generate_ref_response:
-            #         ref_response = ref_response[:, query_tensor.shape[0]:]
 
         if generate_ref_response:
             return response, ref_response
@@ -279,7 +270,7 @@ class PPOTrainer:
     def _generate_batched(
             self,
             model,
-            query_tensors: List[mx.array],
+            query_tensors: List[torch.Tensor],
             length_sampler: Callable = None,
             batch_size: int = 4,
             return_prompt: bool = True,
@@ -301,7 +292,7 @@ class PPOTrainer:
             end_index = min(len(query_tensors), i + batch_size)
 
             batch = query_tensors[i:end_index]
-            batch_mask = [mx.ones_like(element) for element in batch]
+            batch_mask = [torch.ones_like(element) for element in batch]
             inputs = {"input_ids": batch, "attention_mask": batch_mask}
 
             padded_inputs = self.tokenizer.pad(
@@ -335,10 +326,10 @@ class PPOTrainer:
     def _step_safety_checker(
             self,
             batch_size: int,
-            queries: List[mx.array],
-            responses: List[mx.array],
-            scores: List[mx.array],
-            masks: Optional[List[mx.array]] = None,
+            queries: List[torch.Tensor],
+            responses: List[torch.Tensor],
+            scores: List[torch.Tensor],
+            masks: Optional[List[torch.Tensor]] = None,
     ):
         """
         Check if the input data is valid for training.
@@ -360,7 +351,7 @@ class PPOTrainer:
         for name, tensor_list in zip(["queries", "responses", "scores"], [queries, responses, scores]):
             if not isinstance(tensor_list, list):
                 raise ValueError(f"{name} must be a list of mx.array s - got {type(tensor_list)}")
-            if not isinstance(tensor_list[0], mx.array):
+            if not isinstance(tensor_list[0], torch.Tensor):
                 raise ValueError(f"Elements in {name} must be mx.array - got {type(tensor_list[0])}")
             if batch_size is not None and len(tensor_list) != batch_size:
                 raise ValueError(
@@ -378,10 +369,10 @@ class PPOTrainer:
 
     def step(
             self,
-            queries: List[mx.array],
-            responses: List[mx.array],
-            scores: List[mx.array],
-            response_masks: Optional[List[mx.array]] = None,
+            queries: List[torch.Tensor],
+            responses: List[torch.Tensor],
+            scores: List[torch.Tensor],
+            response_masks: Optional[List[torch.Tensor]] = None,
     ):
         """
         Run a PPO optimisation step given a list of queries, model responses, and rewards.
@@ -405,7 +396,7 @@ class PPOTrainer:
         queries, responses, scores, response_masks = self._step_safety_checker(
             bs, queries, responses, scores, response_masks
         )
-        scores = mx.array(scores)
+        scores = torch.tensor(scores)
         if self.config.use_score_scaling:
             # Score scaling
             scores_mean, scores_std = self.running.update(scores)
@@ -418,7 +409,7 @@ class PPOTrainer:
 
         if self.config.score_clip is not None:
             # Score clipping
-            scores = mx.clip(scores, -self.config.score_clip, self.config.score_clip)
+            scores = torch.clip(scores, -self.config.score_clip, self.config.score_clip)
 
         # if we want to push best model to the hub
         # TODO: Put highest reward model saving back in here, if desired.
@@ -505,7 +496,7 @@ class PPOTrainer:
 
                 for mini_batch_start in range(0, self.config.backward_batch_size, self.config.mini_batch_size):
                     mini_batch_end = mini_batch_start + self.config.mini_batch_size
-                    mini_batch_inds = mx.array(backward_batch_inds[mini_batch_start:mini_batch_end])
+                    mini_batch_inds = torch.tensor(backward_batch_inds[mini_batch_start:mini_batch_end])
                     mini_batch_dict = {
                         "logprobs": batch_dict["logprobs"][mini_batch_inds],
                         "values": batch_dict["values"][mini_batch_inds],
@@ -517,7 +508,7 @@ class PPOTrainer:
                         "returns": batch_dict["returns"][mini_batch_inds],
                     }
                     for k in model_inputs_names:
-                        mini_batch_dict[k] = mx.array(batch_dict[k])[mini_batch_inds]
+                        mini_batch_dict[k] = torch.cat(batch_dict[k])[mini_batch_inds]
                     model_inputs = {k: mini_batch_dict[k] for k in model_inputs_names}
 
                     train_stats = self.train_minibatch(
@@ -545,11 +536,11 @@ class PPOTrainer:
         train_stats = stack_dicts(all_stats)
 
         # reshape advantages/ratios such that they are not averaged.
-        train_stats["policy/advantages"] = mx.flatten(train_stats["policy/advantages"])
-        train_stats["policy/advantages"] = mx.array(np.nan_to_num(train_stats['policy/advantages'], nan=-1))
+        train_stats["policy/advantages"] = torch.flatten(train_stats["policy/advantages"])
+        train_stats["policy/advantages"] = torch.tensor(np.nan_to_num(train_stats['policy/advantages'], nan=-1))
         train_stats['policy/advantages'] = train_stats['policy/advantages'][None, :]
         # train_stats["policy/advantages"] = torch.nan_to_num(train_stats["policy/advantages"], WANDB_PADDING)
-        train_stats["policy/ratio"] = mx.flatten(train_stats["policy/ratio"])[None, :]
+        train_stats["policy/ratio"] = torch.flatten(train_stats["policy/ratio"])[None, :]
 
         stats = self.record_step_stats(
             scores=scores,
@@ -609,22 +600,22 @@ class PPOTrainer:
             early_stop = True
         return early_stop
 
-    def prepare_model_inputs(self, queries: mx.array, responses: mx.array):
+    def prepare_model_inputs(self, queries: torch.Tensor, responses: torch.Tensor):
         if self.is_encoder_decoder:
             input_data = self.data_collator(
-                [{"input_ids": q, "attention_mask": mx.ones_like(q)} for q in queries]
+                [{"input_ids": q, "attention_mask": torch.ones_like(q)} for q in queries]
             )
 
             decoder_inputs = self.data_collator(
-                [{"input_ids": r, "attention_mask": mx.ones_like(r)} for r in responses]
+                [{"input_ids": r, "attention_mask": torch.ones_like(r)} for r in responses]
             )
 
             input_data["decoder_input_ids"] = decoder_inputs["input_ids"]
             input_data["decoder_attention_mask"] = decoder_inputs["attention_mask"]
         else:
-            input_ids = [mx.concatenate([q, r]).astype(q.dtype) for q, r in zip(queries, responses)]
+            input_ids = [torch.concatenate([q, r], dim=1).to(q.dtype) for q, r in zip(queries, responses)]
             input_data = self.data_collator(
-                [{"input_ids": ids, "attention_mask": mx.ones_like(ids)} for ids in input_ids]
+                [{"input_ids": ids, "attention_mask": torch.ones_like(ids)} for ids in input_ids]
             )
 
         input_data.pop("labels", None)  # we don't want to compute LM losses
@@ -633,11 +624,11 @@ class PPOTrainer:
     def batched_forward_pass(
             self,
             model,
-            queries: mx.array,
-            responses: mx.array,
+            queries: torch.Tensor,
+            responses: torch.Tensor,
             model_inputs: dict,
             return_logits: bool = False,
-            response_masks: Optional[mx.array] = None,
+            response_masks: Optional[torch.Tensor] = None,
     ):
         """
         Calculate model outputs in multiple batches.
@@ -665,16 +656,18 @@ class PPOTrainer:
         all_values = []
 
         for i in range(math.ceil(bs / fbs)):
-            input_kwargs = {k: mx.array(v[i * fbs: (i + 1) * fbs]) for k, v in model_inputs.items()}
-            query_batch = queries[i * fbs: (i + 1) * fbs]
-            response_batch = responses[i * fbs: (i + 1) * fbs]
+            input_kwargs = {k: torch.cat(v[i * fbs: (i + 1) * fbs]) if type(v[i * fbs: (i + 1) * fbs]) is not torch.Tensor else v[i * fbs: (i + 1) * fbs] for k, v in model_inputs.items()}
+            query_batch = torch.cat(queries[i * fbs: (i + 1) * fbs])
+            response_batch = torch.cat(responses[i * fbs: (i + 1) * fbs])
             if response_masks is not None:
                 response_masks_batch = response_masks[i * fbs: (i + 1) * fbs]
-            logits, cache, values = model(**input_kwargs)
-            input_ids = mx.array(input_kwargs["input_ids"])
-            attention_mask = mx.array(input_kwargs["attention_mask"])
+            output = model(**input_kwargs, output_hidden_states=True)
+            logits = output.logits
+            values = model.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
+            input_ids = torch.tensor(input_kwargs["input_ids"])
+            attention_mask = torch.tensor(input_kwargs["attention_mask"])
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
-            masks = mx.zeros_like(attention_mask)
+            masks = torch.zeros_like(attention_mask)
             masks[:, :-1] = attention_mask[:, 1:]
 
             for j in range(len(query_batch)):
@@ -688,8 +681,8 @@ class PPOTrainer:
                         start += attention_mask[j, :].nonzero()[0]
                     end = start + len(response_batch[j])
                     if response_masks is not None:
-                        response_masks_batch[j] = mx.concatenate(
-                            (mx.zeros_like(query_batch[j]), response_masks_batch[j])
+                        response_masks_batch[j] = torch.concatenate(
+                            (torch.zeros_like(query_batch[j]), response_masks_batch[j])
                         )[1:]
 
                 masks[j, :start] = 0
@@ -706,22 +699,22 @@ class PPOTrainer:
             all_masks.append(masks)
 
         return (
-            mx.concatenate(all_logprobs),
-            mx.concatenate(all_logits)[:, :-1] if return_logits else None,
-            mx.concatenate(all_values)[:, :-1],
-            mx.concatenate(all_masks)[:, :-1],
+            torch.concatenate(all_logprobs),
+            torch.concatenate(all_logits)[:, :-1] if return_logits else None,
+            torch.concatenate(all_values)[:, :-1],
+            torch.concatenate(all_masks)[:, :-1],
         )
 
     def train_minibatch(
             self,
-            old_logprobs: mx.array,
-            values: mx.array,
-            queries: mx.array,
-            responses: mx.array,
+            old_logprobs: torch.Tensor,
+            values: torch.Tensor,
+            queries: torch.Tensor,
+            responses: torch.Tensor,
             model_inputs,
-            mask: mx.array,
-            advantages: mx.array,
-            returns: mx.array,
+            mask: torch.Tensor,
+            advantages: torch.Tensor,
+            returns: torch.Tensor,
     ):
         """
         Train one PPO minibatch
@@ -748,7 +741,8 @@ class PPOTrainer:
             train_stats (dict[str, `mx.array`]):
                 Dictionary of training statistics
         """
-        (lvalue, stats), grad = self.loss_value_and_grad(
+        self.model.train()
+        loss, train_stats = self.loss_fn(
             model=self.model,
             queries=queries,
             responses=responses,
@@ -759,22 +753,21 @@ class PPOTrainer:
             advantages=advantages,
             returns=returns,
         )
-        # TODO: Clip grad norm
-        #         if self.config.max_grad_norm is not None:
-        #             self.accelerator.clip_grad_norm_(self.model_params, self.config.max_grad_norm)
-        # test_g = extract_grads(grad)
-        # print(f'Grad sums: {[mx.sum(mx.abs(g)) for g in test_g]}')
-        # Model update
-        self.optimizer.update(self.model, grad)
-        mx.eval(self.model.parameters(), self.optimizer.state, lvalue)
-        return stats
+        loss.backward()
+        # if self.config.max_grad_norm is not None:
+        #         self.clip_grad_norm_(self.model_params, self.config.max_grad_norm)
+        self.optimizer.step()
+        # we call optimizer.zero_grad() every time and let `accelerator` handle accumulation
+        # see https://huggingface.co/docs/accelerate/usage_guides/gradient_accumulation#the-finished-code
+        self.optimizer.zero_grad()
+        return train_stats
 
     def compute_rewards(
             self,
-            scores: mx.array,
-            logprobs: mx.array,
-            ref_logprobs: mx.array,
-            masks: mx.array,
+            scores: torch.Tensor,
+            logprobs: torch.Tensor,
+            ref_logprobs: torch.Tensor,
+            masks: torch.Tensor,
     ):
         """
         Compute per token rewards from scores and KL-penalty.
@@ -799,7 +792,7 @@ class PPOTrainer:
             kls.append(kl_p)
             non_score_rew = -self.kl_ctl.value * kl_p
             non_score_rewards.append(non_score_rew)
-            last_non_masked_index = mx.array(np.nonzero(mask)[0][-1])  # Or remove the [0]
+            last_non_masked_index = torch.tensor(np.nonzero(mask)[0][-1])  # Or remove the [0]
             # print(f'last index: {last_non_masked_index}')
             # print(f'other calc: {mx.array(np.nonzero(mask)[0][-1])}')
             # print(f'non score rew: {non_score_rew}')
@@ -808,9 +801,9 @@ class PPOTrainer:
             non_score_rew[last_non_masked_index] += score
             rewards.append(non_score_rew)
 
-        return mx.stack(rewards), mx.stack(non_score_rewards), mx.stack(kls)
+        return torch.stack(rewards), torch.stack(non_score_rewards), torch.stack(kls)
 
-    def _kl_penalty(self, logprob: mx.array, ref_logprob: mx.array) -> mx.array:
+    def _kl_penalty(self, logprob: torch.Tensor, ref_logprob: torch.Tensor) -> torch.Tensor:
         if self.config.kl_penalty == "kl":
             return logprob - ref_logprob
 
@@ -821,15 +814,15 @@ class PPOTrainer:
             return 0.5 * (logprob - ref_logprob).square()
 
         if self.config.kl_penalty == "full":
-            return nn.losses.kl_div_loss(logprob, ref_logprob, reduction="none")  # .sum(-1)
+            return torch.nn.functional.kl_div(ref_logprob, logprob, log_target=True, reduction="none")  # .sum(-1)
 
         raise NotImplementedError
 
     def compute_advantages(
             self,
-            values: mx.array,
-            rewards: mx.array,
-            mask: mx.array,
+            values: torch.Tensor,
+            rewards: torch.Tensor,
+            mask: torch.Tensor,
     ):
         lastgaelam = 0
         advantages_reversed = []
@@ -844,8 +837,13 @@ class PPOTrainer:
             delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
             lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
             advantages_reversed.append(lastgaelam)
-        advantages = mx.stack(advantages_reversed[::-1]).transpose()
+        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+        print(f'advantages reversed: {advantages_reversed}')
+        print(f'Advantages: {advantages}')
+        print(f'advantages shape: {advantages.shape}')
+
         returns = advantages + values
+        print(f'returns shape: {returns.shape}')
         # print(f'returns: {[x.item() for y in returns for x in y]}')
         advantages = masked_whiten(advantages, mask)
         return values, advantages, returns
@@ -856,11 +854,11 @@ class PPOTrainer:
             queries,
             responses,
             model_inputs,
-            old_logprobs: mx.array,
-            old_values: mx.array,
-            mask: mx.array,
-            advantages: mx.array,
-            returns: mx.array,
+            old_logprobs: torch.Tensor,
+            old_values: torch.Tensor,
+            mask: torch.Tensor,
+            advantages: torch.Tensor,
+            returns: torch.Tensor,
     ):
         """
         Calculate policy and value losses.
@@ -892,23 +890,28 @@ class PPOTrainer:
             model_inputs,
             return_logits=True,
         )
+        old_logprobs = old_logprobs.detach()
+        advantages = advantages.detach()
+        returns = returns.detach()
+        old_values = old_values.detach()
+
         logratio = newlogprob - old_logprobs
         ratio = logratio.exp()
 
         # Policy loss
         pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * mx.clip(ratio, 1 - self.config.cliprange, 1 + self.config.cliprange)
-        pg_loss = mx.max(mx.stack([pg_loss1, pg_loss2]), axis=0).mean()
+        pg_loss2 = -advantages * torch.clip(ratio, 1 - self.config.cliprange, 1 + self.config.cliprange)
+        pg_loss = torch.max(torch.stack([pg_loss1, pg_loss2]), dim=0).values.mean()
         # Value Loss
         if self.config.clip_value_loss:
             vf_loss_unclipped = (newvalue - returns) ** 2
-            vf_clipped = old_values + mx.clip(
+            vf_clipped = old_values + torch.clip(
                 newvalue - old_values,
                 -self.config.cliprange_value,
                 self.config.cliprange_value,
             )
             vf_loss_clipped = (vf_clipped - returns) ** 2
-            vf_loss_max = mx.max(mx.stack([vf_loss_unclipped, vf_loss_clipped]), axis=0)
+            vf_loss_max = torch.max(torch.stack([vf_loss_unclipped, vf_loss_clipped]), dim=0).values
             vf_loss = 0.5 * vf_loss_max.mean()
         else:
             vf_loss = 0.5 * ((newvalue - returns) ** 2).mean()
@@ -930,19 +933,19 @@ class PPOTrainer:
         return loss_v, flatten_dict(dict(
             loss=dict(policy=pg_loss, value=vf_loss, total=loss_v),
             policy=dict(
-                entropy=mx.array([0]),
-                approxkl=mx.array([0]),
-                policykl=mx.array([0]),
+                entropy=torch.tensor([0]),
+                approxkl=torch.tensor([0]),
+                policykl=torch.tensor([0]),
                 advantages=advantages,
                 advantages_mean=masked_mean(advantages, mask),
                 ratio=ratio,
             ),
-            returns=dict(mean=mx.mean(returns), var=mx.var(returns)),
+            returns=dict(mean=torch.mean(returns), var=torch.var(returns)),
             val=dict(
                 vpred=masked_mean(newvalue, mask),
                 error=masked_mean((newvalue - returns) ** 2, mask),
-                mean=mx.array([0]),
-                var=mx.array([0]),
+                mean=torch.tensor([0]),
+                var=torch.tensor([0]),
             ),
         ))
 
@@ -995,18 +998,18 @@ class PPOTrainer:
         }
 
         # Log text properties
-        query_lens = mx.array([len(query) for query in data["queries"]])
-        response_lens = mx.array([len(response) for response in data["responses"]])
+        query_lens = torch.tensor([len(query) for query in data["queries"]])
+        response_lens = torch.tensor([len(response) for response in data["responses"]])
 
-        stats["tokens/queries_len_mean"] = mx.mean(query_lens).item()
-        stats["tokens/queries_len_std"] = mx.var(query_lens).sqrt().item()
+        stats["tokens/queries_len_mean"] = torch.mean(query_lens.to(torch.float)).item()
+        stats["tokens/queries_len_std"] = torch.var(query_lens.to(torch.float)).sqrt().item()
         stats["tokens/queries_dist"] = query_lens
-        stats["tokens/responses_len_mean"] = mx.mean(response_lens).item()
-        stats["tokens/responses_len_std"] = mx.var(response_lens).sqrt().item()
+        stats["tokens/responses_len_mean"] = torch.mean(response_lens.to(torch.float)).item()
+        stats["tokens/responses_len_std"] = torch.var(response_lens.to(torch.float)).sqrt().item()
         stats["tokens/responses_dist"] = response_lens
 
         for k, v in data["train_stats"].items():
-            stats[f"ppo/{k}"] = mx.mean(v, axis=0)
+            stats[f"ppo/{k}"] = torch.mean(v.to(torch.float), axis=0)
         stats["ppo/val/var_explained"] = 1 - stats["ppo/val/error"] / stats["ppo/returns/var"]
         return stats
 
@@ -1014,7 +1017,7 @@ class PPOTrainer:
             self,
             stats: dict,
             batch: dict,
-            rewards: List[mx.array],
+            rewards: List[torch.Tensor],
             columns_to_log: List[str] = ["query", "response"],
     ):
         """
@@ -1030,8 +1033,8 @@ class PPOTrainer:
         """
 
         # all gather stats
-        if not isinstance(rewards, mx.array):
-            rewards = mx.array(rewards)
+        if not isinstance(rewards, torch.Tensor):
+            rewards = torch.tensor(rewards)
         rewards = rewards.flatten()
 
         if any([column_to_log not in batch.keys() for column_to_log in columns_to_log]):
@@ -1055,8 +1058,8 @@ class PPOTrainer:
 
         logs.update(stats)
 
-        logs["env/reward_mean"] = mx.mean(rewards).item()
-        logs["env/reward_std"] = mx.var(rewards).sqrt().item()
+        logs["env/reward_mean"] = torch.mean(rewards).item()
+        logs["env/reward_std"] = torch.var(rewards).sqrt().item()
         logs["env/reward_dist"] = np.array(rewards)
         for k, v in logs.items():
             # print(f'{k}: {v}')
