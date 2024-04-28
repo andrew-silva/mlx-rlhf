@@ -50,7 +50,7 @@ class RunningMoments:
 
         new_sum = xs_var * xs_count
         # correct old_sum deviation accounting for the new mean
-        old_sum = self.var * self.count + delta**2 * self.count * xs_count / tot_count
+        old_sum = self.var * self.count + delta ** 2 * self.count * xs_count / tot_count
         tot_sum = old_sum + new_sum
 
         self.mean += delta * xs_count / tot_count
@@ -59,7 +59,6 @@ class RunningMoments:
         self.count = tot_count
 
         return xs_mean, mx.sqrt(xs_var * xs_count / (xs_count - 1)).item()
-
 
 
 class AdaptiveKLController:
@@ -129,12 +128,26 @@ def logprobs_from_logits(logits: mx.array, labels: mx.array, gather: bool = True
     """
     Turn raw logit values into log probs with softmax + log -- make sure axis is correct
     """
-    logp = mx.log(mx.softmax(logits, axis=2))
+    logp = nn.log_softmax(logits, axis=2)
+    # logp += 1e-6
+    # logp = mx.log(logp)
 
     if not gather:
         return logp
-    logpy = logp[mx.arange(logp.shape[0]), mx.arange(logp.shape[1]), labels[:, :]]
-    return logpy
+
+    # label_inds = labels.reshape(-1)
+    # dim_1_inds = mx.repeat(mx.arange(logp.shape[0]), logp.shape[1])
+    # dim_2_inds = mx.repeat(mx.arange(logp.shape[1]), logp.shape[0])
+    # logpy = logp[dim_1_inds, dim_2_inds, label_inds]
+    #
+    # logpy = logpy.reshape((logp.shape[0], logp.shape[1]))
+    # print(f'Log py: {logpy}')
+    logpy = np.take_along_axis(np.array(logp.astype(mx.float32)),
+                               np.array(labels[:, :, None]), axis=2)
+    if np.any(np.isnan(logpy)):
+        print("Uh oh. NaNs in the log probs!!")
+
+    return mx.array(logpy).squeeze(-1)
 
 
 def whiten(values: mx.array, shift_mean: bool = True) -> mx.array:
@@ -158,7 +171,7 @@ def masked_var(values: mx.array, mask: mx.array, unbiased: bool = True) -> mx.ar
     """Compute variance of tensor with masked values."""
     mean = masked_mean(values, mask)
     centered_values = values - mean
-    variance = masked_mean(centered_values**2, mask)
+    variance = masked_mean(centered_values ** 2, mask)
     if unbiased:
         mask_sum = mask.sum()
         if mask_sum == 0:
@@ -283,7 +296,7 @@ def stack_dicts(stats_dicts: List[Dict]) -> Dict:
         padded = []
         for x in stats_list:
             if len(x) < max_len:
-                buffer = mx.ones(max_len-len(x)).astype(x.dtype)
+                buffer = mx.ones(max_len - len(x)).astype(x.dtype)
                 x = mx.concatenate((x, buffer))
             padded.append(x)
         results[k] = mx.array(padded)
@@ -299,7 +312,7 @@ def convert_to_scalar(stats: Dict) -> Dict:
         # for tensorboard compatibility - arrays and tensors are ignored with tensorboard
         # therefore we convert single element tensors to scalars
         if (isinstance(v, mx.array) or isinstance(v, np.ndarray)) and (
-            len(v.shape) == 0 or (len(v.shape) == 1 and v.shape[0] == 1)
+                len(v.shape) == 0 or (len(v.shape) == 1 and v.shape[0] == 1)
         ):
             v = v.item()
         tensorboard_stats[k] = v
@@ -332,7 +345,6 @@ def exact_div(a, b, a_str, b_str, custom_error_message=""):
     if a != q * b:
         raise ValueError(f"{custom_error_message}, {a_str}={a}, {b_str}={b}, inexact division: {a} / {b} = {a / b}")
     return q
-
 
 
 def _get_classes(config: dict):
@@ -477,7 +489,7 @@ def load(path_or_hf_repo: str):
             model,
             **quantization,
             linear_class_predicate=lambda m: isinstance(m, nn.Linear)
-            and m.weight.shape[0] != 8,
+                                             and m.weight.shape[0] != 8,
         )
 
     model.load_weights(list(weights.items()), strict=False)
@@ -488,7 +500,7 @@ def load(path_or_hf_repo: str):
 
 
 def _generate_token(
-    prompt: mx.array, model: nn.Module, temp: float = 0.0
+        prompt: mx.array, model: nn.Module, temp: float = 0.0
 ) -> Generator[mx.array, None, None]:
     """
     Generate text based on the given prompt and model.
@@ -514,7 +526,7 @@ def _generate_token(
     cache = None
     while True:
         if len(y.shape) < 2:
-            y = y[None]
+            y = y[:, None]
         logits, cache, _ = model(y, cache=cache)
         if logits.shape[1] < 1:
             logits = logits[:, None, :]
@@ -535,13 +547,13 @@ def generate(model, prompt, tokenizer, args):
     tokens = []
     skip = 0
     for token, n in zip(
-        _generate_token(prompt, model, args.temp),
-        range(args.max_tokens),
+            _generate_token(prompt, model, args.temp),
+            range(args.max_tokens),
     ):
-        if token == tokenizer.eos_token_id:
-            break
+        # if token == tokenizer.eos_token_id:
+        #     break
 
-        tokens.append(token.item())
+        tokens.append([x.item() for x in token])
         s = tokenizer.decode(tokens)
         if len(s) - skip > 1:
             print(s[skip:-1], end="", flush=True)
@@ -554,16 +566,15 @@ def generate(model, prompt, tokenizer, args):
 
 
 def generate_ids(model, input_ids, eos_token_id=100_000, temperature=0.0, max_tokens=128):
-
     prompt = mx.array(input_ids)
     tokens = []
     for token, n in zip(
-        _generate_token(prompt, model, temperature),
-        range(max_tokens),
+            _generate_token(prompt, model, temperature),
+            range(max_tokens),
     ):
-        if token == eos_token_id:
-            break
+        # if token == eos_token_id:
+        #     break
         if len(token.shape) < 2:
             token = token[None]
         tokens.append(token)
-    return mx.concatenate(tokens, axis=1)
+    return mx.concatenate(tokens, axis=0).transpose()

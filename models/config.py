@@ -90,13 +90,13 @@ class PPOConfig:
     """Range for clipping in PPO policy gradient loss"""
     cliprange_value: float = 0.2
     """Range for clipping values in loss calculation"""
-    clip_value_loss: bool = False
+    clip_value_loss: bool = True
     """Clip the value prediction loss, otherwise full value loss"""
     vf_coef: float = 0.1
     """Scaling factor for value loss"""
-    batch_size: int = 1
+    batch_size: int = 4
     """Number of samples per optimisation step"""
-    mini_batch_size: int = 1
+    mini_batch_size: int = 4
     """Number of samples optimized in each mini batch"""
     gradient_accumulation_steps: int = 1
     """The number of gradient accumulation steps"""

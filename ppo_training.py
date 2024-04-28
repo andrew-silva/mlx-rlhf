@@ -106,22 +106,25 @@ def main(args_in, ppo_config_in):
         "top_p": 1.0,
         "do_sample": True,
         "pad_token_id": tokenizer.eos_token_id,
-        "max_new_tokens": 32,
+        "max_new_tokens": 20,
     }
 
     # TODO: add a command-line arg for num-steps
     for epoch in range(10000):
         # TODO: Add a command-line arg for a prompt before each call?
         # text_in = 'Count up even numbers 2 8 20'
-        start_int = random.randint(0, 10) * 2
-        text_in = f'{start_int}'
         # text_in = ''
+        text_in = []
+        for _ in range(ppo_config_in.batch_size):
+            start_int = random.randint(0, 10) * 2
+            text_in.append(f'{start_int}')
 
         batch = {
-            'query': [text_in],
+            'query': text_in,
             # 'input_ids': mx.array(tokenizer.encode(text_in))
         }
-        query_tensors = mx.array(tokenizer.encode(text_in))  # batch["input_ids"]
+        input_text = tokenizer.pad(tokenizer(text_in).data)['input_ids']
+        query_tensors = mx.array(input_text)  # batch["input_ids"]
 
         # Get response from gpt2
         response_tensors, ref_response_tensors = ppo_trainer.generate(
@@ -130,24 +133,26 @@ def main(args_in, ppo_config_in):
 
         batch["response"] = tokenizer.batch_decode(np.array(response_tensors))
         batch["ref_response"] = tokenizer.batch_decode(np.array(ref_response_tensors))
-        response_tensors = [response_tensors[0]]
-        ref_response_tensors = [ref_response_tensors[0]]
+        # print(response_tensors.shape)
+        # response_tensors = [response_tensors[0]]
+        # print(response_tensors[0].shape)
+        # ref_response_tensors = [ref_response_tensors[0]]
 
         # Compute sentiment score
         # texts = [q + r for q, r in zip(batch["query"], batch["response"])]
 
         if args_in.ground_truth_reward:
-            scores = reward_function(batch['response'])  # Should we omit query in the scoring?
+            scores = reward_function(batch['response'], negated=False)  # Should we omit query in the scoring?
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
         else:
             scored_tensors = mx.array(reward_tokenizer.encode(batch["response"][0]))[None, :]
             _, _, scores = reward_function(mx.array(response_tensors))
             scores = scores[:, -1].item()
-        rewards = [mx.array(scores)]
+        rewards = mx.array(scores)
 
         ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
         if args_in.ground_truth_reward:
-            ref_scores = reward_function(batch['ref_response'])
+            ref_scores = reward_function(batch['ref_response'], negated=True)
         else:
             scored_tensors = mx.array(reward_tokenizer.encode(batch["ref_response"][0]))[None, :]
             _, _, ref_scores = reward_function(mx.array(ref_response_tensors))
@@ -156,7 +161,7 @@ def main(args_in, ppo_config_in):
         batch["ref_rewards"] = ref_scores
 
         # Run PPO step
-        stats = ppo_trainer.step([query_tensors], response_tensors, rewards)
+        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
         ppo_trainer.log_stats(stats, batch, rewards,
                               columns_to_log=["query", "response", "ref_response", "ref_rewards"])
     # Save prompt weights
@@ -188,8 +193,6 @@ if __name__ == "__main__":
 
     parser = HfArgumentParser((ScriptArguments, PPOConfig))
     args, ppo_config = parser.parse_args_into_dataclasses()
-    # TODO: Adaptive KL seems to break things... Why? Over/underflow? Type issues?
-    ppo_config.adap_kl_ctrl = False
 
     # We then define the arguments to pass to the sentiment analysis pipeline.
     # We set `return_all_scores` to True to get the sentiment score for each token.

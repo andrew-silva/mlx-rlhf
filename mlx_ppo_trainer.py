@@ -245,15 +245,13 @@ class PPOTrainer:
                     )
 
         else:
-            if len(query_tensor.shape) == 2:
-                raise ValueError(
-                    "query_tensor must be a tensor of shape (`seq_len`) or a list of tensors of shape (`seq_len`)"
-                )
+            if len(query_tensor.shape) == 1:
+                query_tensor = query_tensor[None, :]
 
             if length_sampler is not None:
                 generation_kwargs["max_new_tokens"] = length_sampler()
             response = generate_ids(model=self.model,
-                                    input_ids=query_tensor[None, :],
+                                    input_ids=query_tensor,
                                     eos_token_id=self.tokenizer.eos_token_id,
                                     temperature=0.0,
                                     max_tokens=generation_kwargs['max_new_tokens'])
@@ -261,7 +259,7 @@ class PPOTrainer:
                 with self.optional_peft_ctx():
                     ref_response = generate_ids(
                         model=ref_model,
-                        input_ids=query_tensor[None, :],
+                        input_ids=query_tensor,
                         eos_token_id=self.tokenizer.eos_token_id,
                         temperature=0.0,
                         max_tokens=generation_kwargs['max_new_tokens']
@@ -358,8 +356,8 @@ class PPOTrainer:
             `tuple`: The input processed data.
         """
         for name, tensor_list in zip(["queries", "responses", "scores"], [queries, responses, scores]):
-            if not isinstance(tensor_list, list):
-                raise ValueError(f"{name} must be a list of mx.array s - got {type(tensor_list)}")
+            # if not isinstance(tensor_list, list):
+            #     raise ValueError(f"{name} must be a list of mx.array s - got {type(tensor_list)}")
             if not isinstance(tensor_list[0], mx.array):
                 raise ValueError(f"Elements in {name} must be mx.array - got {type(tensor_list[0])}")
             if batch_size is not None and len(tensor_list) != batch_size:
@@ -670,7 +668,9 @@ class PPOTrainer:
             response_batch = responses[i * fbs: (i + 1) * fbs]
             if response_masks is not None:
                 response_masks_batch = response_masks[i * fbs: (i + 1) * fbs]
-            logits, cache, values = model(**input_kwargs)
+
+            # logits, _, values = model(**input_kwargs)
+            logits, _, values = model(input_kwargs['input_ids'])  # Remove attention mask for shape issue.
             input_ids = mx.array(input_kwargs["input_ids"])
             attention_mask = mx.array(input_kwargs["attention_mask"])
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
@@ -797,12 +797,9 @@ class PPOTrainer:
             # compute KL penalty (from difference in logprobs)
             kl_p = self._kl_penalty(logprob, ref_logprob)
             kls.append(kl_p)
-            non_score_rew = -self.kl_ctl.value * kl_p
+            non_score_rew = mx.array(-self.kl_ctl.value * kl_p)
             non_score_rewards.append(non_score_rew)
             last_non_masked_index = mx.array(np.nonzero(mask)[0][-1])  # Or remove the [0]
-            # print(f'last index: {last_non_masked_index}')
-            # print(f'other calc: {mx.array(np.nonzero(mask)[0][-1])}')
-            # print(f'non score rew: {non_score_rew}')
 
             # reward is preference model score + KL penalty
             non_score_rew[last_non_masked_index] += score
@@ -846,7 +843,6 @@ class PPOTrainer:
             advantages_reversed.append(lastgaelam)
         advantages = mx.stack(advantages_reversed[::-1]).transpose()
         returns = advantages + values
-        # print(f'returns: {[x.item() for y in returns for x in y]}')
         advantages = masked_whiten(advantages, mask)
         return values, advantages, returns
 
@@ -898,7 +894,8 @@ class PPOTrainer:
         # Policy loss
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * mx.clip(ratio, 1 - self.config.cliprange, 1 + self.config.cliprange)
-        pg_loss = mx.max(mx.stack([pg_loss1, pg_loss2]), axis=0).mean()
+
+        pg_loss = masked_mean(mx.max(mx.stack([pg_loss1, pg_loss2]), axis=0), mask)
         # Value Loss
         if self.config.clip_value_loss:
             vf_loss_unclipped = (newvalue - returns) ** 2
@@ -909,9 +906,9 @@ class PPOTrainer:
             )
             vf_loss_clipped = (vf_clipped - returns) ** 2
             vf_loss_max = mx.max(mx.stack([vf_loss_unclipped, vf_loss_clipped]), axis=0)
-            vf_loss = 0.5 * vf_loss_max.mean()
+            vf_loss = masked_mean(0.5 * vf_loss_max, mask)
         else:
-            vf_loss = 0.5 * ((newvalue - returns) ** 2).mean()
+            vf_loss = masked_mean(0.5 * ((newvalue - returns) ** 2), mask)
             # print(vf_loss.shape)
             # print(nn.losses.mse_loss(newvalue, returns).shape)
             # print(vf_loss)

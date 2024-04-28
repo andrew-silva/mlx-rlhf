@@ -557,7 +557,7 @@ class PPOTrainer:
         # Gather/Reduce stats from all processes
         stats = stats_to_np(stats)
         timing["time/ppo/calc_stats"] = time.time() - t
-        stats["ppo/learning_rate"] = np.array(self.optimizer.learning_rate)
+        stats["ppo/learning_rate"] = np.array(self.optimizer.param_groups[0]['lr'])
 
         # Update the KL control - multiply the batch_size by the number of processes
         self.kl_ctl.update(
@@ -792,7 +792,7 @@ class PPOTrainer:
             kls.append(kl_p)
             non_score_rew = -self.kl_ctl.value * kl_p
             non_score_rewards.append(non_score_rew)
-            last_non_masked_index = torch.tensor(np.nonzero(mask)[0][-1])  # Or remove the [0]
+            last_non_masked_index = mask.nonzero()[-1]
             # print(f'last index: {last_non_masked_index}')
             # print(f'other calc: {mx.array(np.nonzero(mask)[0][-1])}')
             # print(f'non score rew: {non_score_rew}')
@@ -838,13 +838,9 @@ class PPOTrainer:
             lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
             advantages_reversed.append(lastgaelam)
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
-        print(f'advantages reversed: {advantages_reversed}')
-        print(f'Advantages: {advantages}')
-        print(f'advantages shape: {advantages.shape}')
 
         returns = advantages + values
-        print(f'returns shape: {returns.shape}')
-        # print(f'returns: {[x.item() for y in returns for x in y]}')
+
         advantages = masked_whiten(advantages, mask)
         return values, advantages, returns
 
@@ -901,7 +897,7 @@ class PPOTrainer:
         # Policy loss
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * torch.clip(ratio, 1 - self.config.cliprange, 1 + self.config.cliprange)
-        pg_loss = torch.max(torch.stack([pg_loss1, pg_loss2]), dim=0).values.mean()
+        pg_loss = masked_mean(torch.max(torch.stack([pg_loss1, pg_loss2]), dim=0).values, mask)
         # Value Loss
         if self.config.clip_value_loss:
             vf_loss_unclipped = (newvalue - returns) ** 2
@@ -912,9 +908,9 @@ class PPOTrainer:
             )
             vf_loss_clipped = (vf_clipped - returns) ** 2
             vf_loss_max = torch.max(torch.stack([vf_loss_unclipped, vf_loss_clipped]), dim=0).values
-            vf_loss = 0.5 * vf_loss_max.mean()
+            vf_loss = masked_mean(0.5 * vf_loss_max, mask)
         else:
-            vf_loss = 0.5 * ((newvalue - returns) ** 2).mean()
+            vf_loss = masked_mean(0.5 * ((newvalue - returns) ** 2), mask)
             # print(vf_loss.shape)
             # print(nn.losses.mse_loss(newvalue, returns).shape)
             # print(vf_loss)

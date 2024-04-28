@@ -190,7 +190,7 @@ def stats_to_np(stats_dict: Dict) -> Dict:
             new_dict[k] = v
             if new_dict[k].dtype == torch.bfloat16:
                 new_dict[k] = new_dict[k].astype(torch.float32)
-            new_dict[k] = np.array(new_dict[k])
+            new_dict[k] = np.array(new_dict[k].cpu().detach())
         else:
             new_dict[k] = v
         if np.isscalar(new_dict[k]):
