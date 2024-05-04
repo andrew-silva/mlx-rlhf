@@ -349,8 +349,6 @@ class PPOTrainer:
             `tuple`: The input processed data.
         """
         for name, tensor_list in zip(["queries", "responses", "scores"], [queries, responses, scores]):
-            if not isinstance(tensor_list, list):
-                raise ValueError(f"{name} must be a list of mx.array s - got {type(tensor_list)}")
             if not isinstance(tensor_list[0], torch.Tensor):
                 raise ValueError(f"Elements in {name} must be mx.array - got {type(tensor_list[0])}")
             if batch_size is not None and len(tensor_list) != batch_size:
@@ -537,7 +535,7 @@ class PPOTrainer:
 
         # reshape advantages/ratios such that they are not averaged.
         train_stats["policy/advantages"] = torch.flatten(train_stats["policy/advantages"])
-        train_stats["policy/advantages"] = torch.tensor(np.nan_to_num(train_stats['policy/advantages'], nan=-1))
+        train_stats["policy/advantages"] = torch.tensor(np.nan_to_num(train_stats['policy/advantages'].cpu().detach(), nan=-1))
         train_stats['policy/advantages'] = train_stats['policy/advantages'][None, :]
         # train_stats["policy/advantages"] = torch.nan_to_num(train_stats["policy/advantages"], WANDB_PADDING)
         train_stats["policy/ratio"] = torch.flatten(train_stats["policy/ratio"])[None, :]
@@ -613,7 +611,7 @@ class PPOTrainer:
             input_data["decoder_input_ids"] = decoder_inputs["input_ids"]
             input_data["decoder_attention_mask"] = decoder_inputs["attention_mask"]
         else:
-            input_ids = [torch.concatenate([q, r], dim=1).to(q.dtype) for q, r in zip(queries, responses)]
+            input_ids = [torch.concatenate([q, r]).to(q.dtype).unsqueeze(0) for q, r in zip(queries, responses)]
             input_data = self.data_collator(
                 [{"input_ids": ids, "attention_mask": torch.ones_like(ids)} for ids in input_ids]
             )
@@ -656,9 +654,9 @@ class PPOTrainer:
         all_values = []
 
         for i in range(math.ceil(bs / fbs)):
-            input_kwargs = {k: torch.cat(v[i * fbs: (i + 1) * fbs]) if type(v[i * fbs: (i + 1) * fbs]) is not torch.Tensor else v[i * fbs: (i + 1) * fbs] for k, v in model_inputs.items()}
-            query_batch = torch.cat(queries[i * fbs: (i + 1) * fbs])
-            response_batch = torch.cat(responses[i * fbs: (i + 1) * fbs])
+            input_kwargs = {k: torch.cat(v[i * fbs: (i + 1) * fbs], dim=0).to(self.device) if type(v[i * fbs: (i + 1) * fbs]) is not torch.Tensor else v[i * fbs: (i + 1) * fbs] for k, v in model_inputs.items()}
+            query_batch = queries[i * fbs: (i + 1) * fbs]
+            response_batch = responses[i * fbs: (i + 1) * fbs]
             if response_masks is not None:
                 response_masks_batch = response_masks[i * fbs: (i + 1) * fbs]
             output = model(**input_kwargs, output_hidden_states=True)
@@ -699,10 +697,10 @@ class PPOTrainer:
             all_masks.append(masks)
 
         return (
-            torch.concatenate(all_logprobs),
-            torch.concatenate(all_logits)[:, :-1] if return_logits else None,
-            torch.concatenate(all_values)[:, :-1],
-            torch.concatenate(all_masks)[:, :-1],
+            torch.concatenate(all_logprobs).to(self.device),
+            torch.concatenate(all_logits)[:, :-1].to(self.device) if return_logits else None,
+            torch.concatenate(all_values)[:, :-1].to(self.device),
+            torch.concatenate(all_masks)[:, :-1].to(self.device),
         )
 
     def train_minibatch(
@@ -1054,9 +1052,9 @@ class PPOTrainer:
 
         logs.update(stats)
 
-        logs["env/reward_mean"] = torch.mean(rewards).item()
-        logs["env/reward_std"] = torch.var(rewards).sqrt().item()
-        logs["env/reward_dist"] = np.array(rewards)
+        logs["env/reward_mean"] = torch.mean(rewards.cpu().detach()).item()
+        logs["env/reward_std"] = torch.var(rewards.cpu().detach()).sqrt().item()
+        logs["env/reward_dist"] = np.array(rewards.cpu().detach())
         for k, v in logs.items():
             # print(f'{k}: {v}')
             logs[k] = np.mean(v).item()

@@ -2,12 +2,13 @@ import random
 
 
 class RewardFunction:
-    def __init__(self, is_positive=False, is_negative=False, is_increasing=False, is_decreasing=False, multiple_of=1):
+    def __init__(self, is_positive=False, is_negative=False, is_increasing=False, is_decreasing=False, multiple_of=1, min_length=5):
         self.is_positive = is_positive
         self.is_negative = is_negative
         self.is_increasing = is_increasing
         self.is_decreasing = is_decreasing
         self.multiple_of = multiple_of
+        self.min_length = min_length
 
     def check_positive(self, num):
         return num > 0 if self.is_positive else True
@@ -58,9 +59,9 @@ class RewardFunction:
                     # Ignore non-integer words
                     pass
             if negated:
-                scores.append(count_matches / len(words) - 1)
+                scores.append(count_matches / max(len(words), self.min_length) - 1)
             else:
-                scores.append(count_matches / len(words))
+                scores.append(count_matches / max(len(words), self.min_length))
         return scores
 
 
@@ -79,7 +80,7 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
     for _ in range(num_samples):
         sequence_length = random.randint(*sequence_length_range)
         if reward_function.is_increasing:
-            start_range = (0, 10)
+            start_range = (0, 200)
 
         else:
             start_range = (100, 1000)
@@ -92,7 +93,7 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
             if random.random() < (1-percent_noise):
                 # Generate a digit that matches the pattern
                 if reward_function.is_increasing:
-                    digit = random.randint(sequence[-1], sequence[-1] + 10)
+                    digit = random.randint(sequence[-1], sequence[-1] + 50)
                     digit += (reward_function.multiple_of - digit % reward_function.multiple_of)
                 elif reward_function.is_decreasing:
                     digit = random.randint(sequence[-1] - 10, sequence[-1])

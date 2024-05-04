@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 """
 Example command for supervised fine-tuning with LoRA on generated data with a HF tiny llama
-python pytorch_sft.py --save-file lora_weights.npz --data-base increasing_mult_2_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train
+python pytorch_sft.py --save-file sft_fine_tune --data-base increasing_mult_1_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train --iters 1500 --data ../data/
 
 Example command for training a reward model with LoRA on generated data with a HF tiny llama
 python pytorch_sft.py --reward-model --train --data-base reward_function_increasing_mult_2_ --batch-size 16 --save-file reward_lora.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -273,7 +273,7 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
         if (it == 0 or (it + 1) % train_args.steps_per_eval == 0) and val_set is not None:
             stop = time.perf_counter()
             val_loss = evaluate(
-                mdl, val_set, tok, train_args
+                mdl, val_set, tok, train_args, device
             )
             print(
                 f"Iter {it + 1}: "
@@ -299,6 +299,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     np.random.seed(args.seed)
+
+    DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
     print("Loading pretrained model")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -328,9 +330,11 @@ if __name__ == "__main__":
         print("Training")
         opt = optim.Adam(model.parameters(), lr=args.learning_rate)
 
+        model = model.to(DEVICE)
+
         # Train model
-        train(model, train_set, valid_set, opt, tokenizer, args)
+        train(model, train_set, valid_set, opt, tokenizer, args, device=DEVICE)
 
         # Save model
-        model.merge_and_unload()
+        model = model.merge_and_unload()
         model.save_pretrained(args.save_file)

@@ -161,3 +161,9 @@ cython_debug/
 
 *.DS_Store
 
+wandb/
+
+sft_fine_tune/
+
+*.png
+

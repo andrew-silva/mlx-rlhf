@@ -107,8 +107,17 @@ def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor, gather: boo
 
     if not gather:
         return logp
-    logpy = logp[torch.arange(logp.shape[0]), torch.arange(logp.shape[1]), labels[:, :]]
-    # logpy = torch.gather(logp, 2, labels.unsqueeze(2)).squeeze(-1)
+    # logpy = logp[torch.arange(logp.shape[0]), torch.arange(logp.shape[1]), labels[:, :]]
+
+    # logpy = np.take_along_axis(np.array(logp.cpu().to(dtype=torch.float32)),
+    #                            np.array(labels.cpu().unsqueeze(2)), axis=2)
+
+    logpy = torch.gather(logp, 2, labels.unsqueeze(2)).squeeze(-1)
+
+    # if np.any(np.isnan(logpy)):
+    #     print("Uh oh. NaNs in the log probs!!")
+
+    # return torch.from_numpy(logpy).squeeze(-1)
     return logpy
 
 
@@ -335,8 +344,8 @@ def _generate_token(
     past_key_values = None
     while True:
         if len(y.shape) < 2:
-            y = y.unsqueeze(0)
-        output = model(y, past_key_values=past_key_values)
+            y = y.unsqueeze(1)
+        output = model(y.to(model.device), past_key_values=past_key_values)
         logits = output.logits
         past_key_values = output.past_key_values
         if logits.shape[1] < 1:
@@ -356,10 +365,10 @@ def generate(model, prompt, tokenizer, args):
         _generate_token(prompt, model, args.temp),
         range(args.max_tokens),
     ):
-        if token == tokenizer.eos_token_id:
-            break
+        # if token == tokenizer.eos_token_id:
+        #     break
 
-        tokens.append(token.item())
+        tokens.append([x.item() for x in token])
         s = tokenizer.decode(tokens)
         if len(s) - skip > 1:
             print(s[skip:-1], end="", flush=True)
@@ -379,9 +388,9 @@ def generate_ids(model, input_ids, eos_token_id=100_000, temperature=0.0, max_to
         _generate_token(prompt, model, temperature),
         range(max_tokens),
     ):
-        if token == eos_token_id:
-            break
+        # if token == eos_token_id:
+        #     break
         if len(token.shape) < 2:
-            token = token[None]
+            token = token.unsqueeze(1)
         tokens.append(token)
     return torch.concatenate(tokens, dim=1)

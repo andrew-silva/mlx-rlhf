@@ -43,6 +43,8 @@ def main(args_in, ppo_config_in):
     np.random.seed(ppo_config_in.seed)
     torch.random.manual_seed(ppo_config_in.seed)
 
+    DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
     # Now let's build the model, the reference model, and the tokenizer.
     # TODO: Actually handle the use_peft parameter
     if not args_in.use_peft:
@@ -60,7 +62,7 @@ def main(args_in, ppo_config_in):
     else:
         model = AutoModelForCausalLM.from_pretrained(args_in.model)
 
-    tokenizer = AutoTokenizer.from_pretrained(args_in.model)
+    tokenizer = AutoTokenizer.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0')
 
     config = LoraConfig(
         task_type="CAUSAL_LM",
@@ -71,6 +73,7 @@ def main(args_in, ppo_config_in):
     )
     model = get_peft_model(model, config)
 
+
     model.value_head = torch.nn.Linear(model.config.hidden_size, 1)
     ref_model.value_head = torch.nn.Linear(ref_model.config.hidden_size, 1)
     # Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
@@ -78,8 +81,11 @@ def main(args_in, ppo_config_in):
         tokenizer.pad_token_id = tokenizer.eos_token_id
         tokenizer.pad_token = tokenizer.eos_token
 
+    model = model.to(DEVICE)
+    ref_model = ref_model.to(DEVICE)
+
     # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
-    ppo_trainer = PPOTrainer(ppo_config_in, model, ref_model, tokenizer, data_collator=collator)
+    ppo_trainer = PPOTrainer(ppo_config_in, model, ref_model, tokenizer, data_collator=collator, device=DEVICE)
 
     if args_in.ground_truth_reward:
         # TODO: Ground-truth reward values are hard-coded here, maybe use a config to set dynamically
@@ -98,57 +104,54 @@ def main(args_in, ppo_config_in):
         "top_p": 1.0,
         "do_sample": True,
         "pad_token_id": tokenizer.eos_token_id,
-        "max_new_tokens": 32,
+        "max_new_tokens": 20,
     }
 
     # TODO: add a command-line arg for num-steps
     for epoch in range(10000):
         # TODO: Add a command-line arg for a prompt before each call?
         # text_in = 'Count up even numbers 2 8 20'
-        start_int = random.randint(0, 10) * 2
-        text_in = f'{start_int}'
-        # text_in = ''
+        text_in = []
+        for _ in range(ppo_config_in.batch_size):
+            start_int = random.randint(0, 10) * 2
+            text_in.append(f'{start_int}')
 
         batch = {
-            'query': [text_in],
+            'query': text_in,
             # 'input_ids': mx.array(tokenizer.encode(text_in))
         }
-        query_tensors = tokenizer.encode(text_in, return_tensors="pt")  # batch["input_ids"]
+        input_text = tokenizer.pad(tokenizer(text_in).data)['input_ids']
+        query_tensors = torch.tensor(input_text, device=DEVICE)  # batch["input_ids"]
 
         # Get response from gpt2
         response_tensors, ref_response_tensors = ppo_trainer.generate(
             query_tensors, return_prompt=False, generate_ref_response=True, **generation_kwargs
         )
 
-        batch["response"] = tokenizer.batch_decode(np.array(response_tensors))
-        batch["ref_response"] = tokenizer.batch_decode(np.array(ref_response_tensors))
-        response_tensors = [response_tensors]
-        ref_response_tensors = [ref_response_tensors]
-
-        # Compute sentiment score
-        # texts = [q + r for q, r in zip(batch["query"], batch["response"])]
+        batch["response"] = tokenizer.batch_decode(np.array(response_tensors.cpu()))
+        batch["ref_response"] = tokenizer.batch_decode(np.array(ref_response_tensors.cpu()))
 
         if args_in.ground_truth_reward:
-            scores = reward_function(batch['response'])  # Should we omit query in the scoring?
+            scores = reward_function(batch['response'], negated=False)  # Should we omit query in the scoring?
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
         else:
-            scored_tensors = tokenizer.encode(batch["response"][0], return_tensors="pt").unsqueeze(0)
-            _, _, scores = reward_function(response_tensors)
+            scored_tensors = torch.tensor(tokenizer.encode(batch["response"]), device=DEVICE).unsqueeze(0)
+            _, _, scores = reward_function(torch.tensor(response_tensors, device=DEVICE))
             scores = scores[:, -1].item()
-        rewards = [torch.tensor(scores)]
+        rewards = torch.tensor(scores, device=DEVICE)
 
         ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
         if args_in.ground_truth_reward:
-            ref_scores = reward_function(batch['ref_response'])
+            ref_scores = reward_function(batch['ref_response'], negated=True)
         else:
-            scored_tensors = tokenizer.encode(batch["ref_response"][0], return_tensors="pt").unsqueeze(0)
-            _, _, ref_scores = reward_function(ref_response_tensors)
+            scored_tensors = torch.tensor(tokenizer.encode(batch["ref_response"]), device=DEVICE).unsqueeze(0)
+            _, _, ref_scores = reward_function(torch.tensor(ref_response_tensors, device=DEVICE))
             ref_scores = [ref_scores[:, -1].item()]
 
         batch["ref_rewards"] = ref_scores
 
         # Run PPO step
-        stats = ppo_trainer.step([query_tensors], response_tensors, rewards)
+        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
         ppo_trainer.log_stats(stats, batch, rewards,
                               columns_to_log=["query", "response", "ref_response", "ref_rewards"])
     # Save prompt weights
