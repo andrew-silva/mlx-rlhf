@@ -577,4 +577,4 @@ def generate_ids(model, input_ids, eos_token_id=100_000, temperature=0.0, max_to
         if len(token.shape) < 2:
             token = token[:, None]
         tokens.append(token)
-    return mx.concatenate(tokens, axis=1)
+    return mx.concatenate(tokens, axis=1)  # .transpose()

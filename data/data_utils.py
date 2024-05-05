@@ -1,6 +1,9 @@
 import random
 from pathlib import Path
 import json
+from data.imessage_chat_data import get_all_txts
+from random import shuffle
+import numpy as np
 
 
 class TuningDataset:
@@ -56,20 +59,44 @@ def load_datasets(train_args):
     ds_base = train_args.data_base
     ds_names = (f"{ds_base}train", f"{ds_base}valid", f"{ds_base}test")
     train_data, valid, test = [], [], []
+    if 'chat' in ds_base:
+        # To do me-chatbot, use 'chat' as data-base and '/path/to/your/message_data' as data
+        all_data = get_all_txts(train_args.data, reverse_query=False)
+        shuffle(all_data)
+        valid_split_size = 1000
+        train_data = all_data[:-valid_split_size]
+        valid = train_data[-valid_split_size:]
+        return train_data, valid, []
+
     if "reward" in ds_base:  # Load a PrefDataset if learning a reward model
         train_data, valid, _ = (PrefDataset(Path(train_args.data) / f"{n}.jsonl") for n in ds_names)
     else:  # Otherwise, load a SFT dataset
         train_data, valid, test = (TuningDataset(Path(train_args.data) / f"{n}.jsonl") for n in ds_names)
-    if train_args.train and len(train_data) == 0:
-        raise ValueError(
-            "Training set not found or empty. Must provide training set for fine-tuning."
-        )
-    if train_args.train and len(valid) == 0:
-        raise ValueError(
-            "Validation set not found or empty. Must provide validation set for fine-tuning."
-        )
-    if train_args.test and len(test) == 0:
-        raise ValueError(
-            "Test set not found or empty. Must provide test set for evaluation."
-        )
     return train_data, valid, test
+
+
+def mask_between_sos(arr_in, sos_token=1, mask_value=-100):
+    """
+    Set all values between the first and last occurrence of SOS to mask_value in each row of the array.
+
+    Parameters:
+        arr_in: Input 2D numpy array
+        sos_token: Value of the SOS token to search for
+        mask_value: Value to overwrite arrays with
+
+    Returns:
+        Modified array with values set to mask_value between the first and last occurrence of SOS in each row
+    """
+    arr_in = np.array(arr_in)
+    # Find the indices of the first and last occurrences of SOS in each row
+    first_ones_indices = np.argmax(arr_in == sos_token, axis=1)
+    last_ones_indices = arr_in.shape[1] - np.argmax(np.flip(arr_in == sos_token, axis=1), axis=1) - 1
+
+    # Create a mask to set values between the first and last occurrences of SOS to mask_value
+    mask = (np.arange(arr_in.shape[1])[:, None] >= first_ones_indices) & \
+           (np.arange(arr_in.shape[1])[:, None] < last_ones_indices)
+
+    # Apply the mask to set values to -100
+    arr_in[mask.transpose()] = mask_value
+
+    return arr_in

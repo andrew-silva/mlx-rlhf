@@ -8,7 +8,7 @@ import math
 import time
 import random
 from pathlib import Path
-from data.data_utils import load_datasets
+from data.data_utils import load_datasets, mask_between_sos
 import matplotlib.pyplot as plt
 
 import mlx.core as mx
@@ -17,10 +17,8 @@ import mlx.optimizers as optim
 import numpy as np
 import utils
 from mlx.utils import tree_flatten
-import datasets
 from models.prompt_tuning import PromptTuning
 from models.lora import LoRALinear
-
 
 """
 Example command for supervised fine-tuning with soft-prompts on generated data with a locally saved tiny llama:
@@ -171,6 +169,14 @@ def loss(mdl, inputs, targets, lengths):
     # Mask padding tokens
     length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
 
+    if -100 in targets[0]:  # If we are masking some targets
+        # Cast to numpy because mlx doesn't support boolean indexing
+        np_len = np.array(length_mask)
+        # Mask out targets
+        np_len[targets == -100] = False
+        # Cast back to mlx
+        length_mask = mx.array(np_len)
+
     # Calculate the loss
     ce = nn.losses.cross_entropy(logits, targets) * length_mask
     ntoks = length_mask.sum()
@@ -193,7 +199,7 @@ def reward_loss(mdl, better_inputs, worse_inputs):
     return diff_val, mx.array(0)  # TODO: this is telling the logger "0 toks per sec"
 
 
-def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=False):
+def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=False, chat_data=False):
     # Shuffle indices
     len_warning_message = "[WARNING] Some sequences are longer than 2048 tokens. " \
                           "Consider pre-splitting your data to save memory."
@@ -238,7 +244,12 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                 for j in range(batch_size):
                     batch_arr[j, : lengths[j]] = batch[j]
                 batch = mx.array(batch_arr)
-                yield batch[:, :-1], batch[:, 1:], mx.array(lengths)
+                if chat_data:
+                    targets = mask_between_sos(arr_in=batch, sos_token=1, mask_value=-100)
+                    targets = mx.array(targets)
+                else:
+                    targets = batch
+                yield batch[:, :-1], targets[:, 1:], mx.array(lengths)
 
         if not train_mode:
             break
@@ -248,8 +259,9 @@ def evaluate(mdl, dataset, loss_fn, tok, train_args):
     all_losses = []
     ntokens = 0
     for it, batch in zip(
-        range(train_args.val_batches),
-        iterate_batches(dataset, tok, train_args.batch_size, reward_modeling=train_args.reward_model),
+            range(train_args.val_batches),
+            iterate_batches(dataset, tok, train_args.batch_size,
+                            reward_modeling=train_args.reward_model, chat_data=train_args.data_base == 'chat'),
     ):
         losses, toks = loss_fn(mdl, *batch)
         all_losses.append((losses * toks).item())
@@ -269,9 +281,10 @@ def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
     # Main training loop
     start = time.perf_counter()
     for it, batch in zip(
-        range(train_args.iters),
-        iterate_batches(train_ds, tok, train_args.batch_size,
-                        train_mode=True, reward_modeling=train_args.reward_model),
+            range(train_args.iters),
+            iterate_batches(train_ds, tok, train_args.batch_size,
+                            train_mode=True, reward_modeling=train_args.reward_model,
+                            chat_data=train_args.data_base == 'chat'),
     ):
 
         # Forward and backward pass
@@ -352,9 +365,9 @@ if __name__ == "__main__":
             if hasattr(l, "block_sparse_moe"):
                 l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
 
-    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10**6
+    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
     print(f"Total parameters {p:.3f}M")
-    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
+    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10 ** 6
     print(f"Trainable parameters {p:.3f}M")
 
     print("Loading datasets")
