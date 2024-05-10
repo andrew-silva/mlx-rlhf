@@ -3,7 +3,7 @@ import re
 
 
 def parse_messages(file_path, reverse_query: bool = False):
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
     if len(lines) < 30:

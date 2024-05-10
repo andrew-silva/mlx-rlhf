@@ -140,23 +140,19 @@ def main(args_in, ppo_config_in):
 
         # Compute sentiment score
         # texts = [q + r for q, r in zip(batch["query"], batch["response"])]
+        # ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
 
         if args_in.ground_truth_reward:
             scores = reward_function(batch['response'], negated=False)  # Should we omit query in the scoring?
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
-        else:
-            scored_tensors = mx.array(reward_tokenizer.encode(batch["response"][0]))[None, :]
-            _, _, scores = reward_function(mx.array(response_tensors))
-            scores = scores[:, -1].item()
-        rewards = mx.array(scores)
-
-        ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
-        if args_in.ground_truth_reward:
             ref_scores = reward_function(batch['ref_response'], negated=True)
         else:
-            scored_tensors = mx.array(reward_tokenizer.encode(batch["ref_response"][0]))[None, :]
+            _, _, scores = reward_function(mx.array(response_tensors))
             _, _, ref_scores = reward_function(mx.array(ref_response_tensors))
+            scores = scores[:, -1].item()
             ref_scores = [ref_scores[:, -1].item()]
+
+        rewards = mx.array(scores)
 
         batch["ref_rewards"] = ref_scores
 

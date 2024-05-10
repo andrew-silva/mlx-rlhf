@@ -29,6 +29,7 @@ from transformers import HfArgumentParser, AutoModel, AutoTokenizer, AutoModelFo
 
 from pytorch_ppo_trainer import PPOTrainer
 from data.digit_seq_rewards import RewardFunction
+from data.data_utils import get_all_txts
 
 from models.config import PPOConfig
 from peft import LoraConfig, get_peft_model
@@ -73,7 +74,6 @@ def main(args_in, ppo_config_in):
     )
     model = get_peft_model(model, config)
 
-
     model.value_head = torch.nn.Linear(model.config.hidden_size, 1)
     ref_model.value_head = torch.nn.Linear(ref_model.config.hidden_size, 1)
     # Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
@@ -93,6 +93,10 @@ def main(args_in, ppo_config_in):
         reward_function = RewardFunction(is_increasing=True, multiple_of=2)
     else:
         reward_function = AutoModel.from_pretrained(args_in.reward_model_dir)
+        reward_function.value_head = torch.nn.Linear(reward_function.config.hidden_size, 1)
+        v_chkpt = torch.load(args.reward_model_dir + '/value_head.pt')
+        reward_function.value_head.load_state_dict(v_chkpt['value_head'])
+        reward_function.to(DEVICE)
 
     # We then define the arguments to pass to the `generate` function. These arguments
     # are passed to the `generate` function of the PPOTrainer, which is a wrapper around
@@ -107,14 +111,18 @@ def main(args_in, ppo_config_in):
         "max_new_tokens": 20,
     }
 
+    train_set = get_all_txts('../../message_data/', reverse_query=False)
+
+
     # TODO: add a command-line arg for num-steps
     for epoch in range(10000):
         # TODO: Add a command-line arg for a prompt before each call?
         # text_in = 'Count up even numbers 2 8 20'
         text_in = []
         for _ in range(ppo_config_in.batch_size):
-            start_int = random.randint(0, 10) * 2
-            text_in.append(f'{start_int}')
+            # start_int = random.randint(0, 10) * 2
+            # text_in.append(f'{start_int}')
+            text_in.append(random.choice(train_set)[0])
 
         batch = {
             'query': text_in,
@@ -133,20 +141,18 @@ def main(args_in, ppo_config_in):
 
         if args_in.ground_truth_reward:
             scores = reward_function(batch['response'], negated=False)  # Should we omit query in the scoring?
+            ref_scores = reward_function(batch['ref_response'], negated=False)
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
         else:
-            scored_tensors = torch.tensor(tokenizer.encode(batch["response"]), device=DEVICE).unsqueeze(0)
-            _, _, scores = reward_function(torch.tensor(response_tensors, device=DEVICE))
-            scores = scores[:, -1].item()
-        rewards = torch.tensor(scores, device=DEVICE)
+            with torch.no_grad():
+                output = reward_function(torch.tensor(response_tensors, device=DEVICE), output_hidden_states=True)
+                scores = reward_function.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
+                output = reward_function(torch.tensor(ref_response_tensors, device=DEVICE), output_hidden_states=True)
+                ref_scores = reward_function.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
+            scores = scores[:, -1]
+            ref_scores = ref_scores[:, -1]
 
-        ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
-        if args_in.ground_truth_reward:
-            ref_scores = reward_function(batch['ref_response'], negated=True)
-        else:
-            scored_tensors = torch.tensor(tokenizer.encode(batch["ref_response"]), device=DEVICE).unsqueeze(0)
-            _, _, ref_scores = reward_function(torch.tensor(ref_response_tensors, device=DEVICE))
-            ref_scores = [ref_scores[:, -1].item()]
+        rewards = scores  # .unsqueeze(1)?
 
         batch["ref_rewards"] = ref_scores
 
@@ -182,9 +188,6 @@ if __name__ == "__main__":
 
     parser = HfArgumentParser((ScriptArguments, PPOConfig))
     args, ppo_config = parser.parse_args_into_dataclasses()
-    # TODO: Adaptive KL seems to break things... Why? Over/underflow?
-    ppo_config.adap_kl_ctrl = False
-
     # We then define the arguments to pass to the sentiment analysis pipeline.
     # We set `return_all_scores` to True to get the sentiment score for each token.
     # sent_kwargs = {"return_all_scores": True, "function_to_apply": "none", "batch_size": 16}

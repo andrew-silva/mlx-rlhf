@@ -1,10 +1,10 @@
 # Modified by Andrew Silva from https://github.com/ml-explore/mlx-examples/blob/main/lora/lora.py
 #
 # Copyright © 2023 Apple Inc.
-
+import os
 import argparse
 import time
-from data.data_utils import load_datasets
+from data.data_utils import load_datasets, mask_between_sos
 
 import matplotlib.pyplot as plt
 
@@ -156,14 +156,18 @@ def reward_loss(mdl, better_inputs, worse_inputs):
         Loss value, tokens-per-second (TODO -- Tokens-per-second implementation missing here)
     """
     # TODO: Batch these, currently this is unnecessarily slow.
-    _, _, rewards_j = mdl(better_inputs)
-    _, _, rewards_k = mdl(worse_inputs)
+    output = mdl(better_inputs, output_hidden_states=True)
+    rewards_j = mdl.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
+
+    output = mdl(worse_inputs, output_hidden_states=True)
+    rewards_k = mdl.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
+
     # Batch x SeqLen x OutputDim -- get last token value
-    diff_val = -torch.nn.functional.logsigmoid(rewards_j[:, -1, :] - rewards_k[:, -1, :]).mean()
-    return diff_val, torch.tensor([0])  # TODO: this is telling the logger "0 toks per sec"
+    diff_val = -torch.nn.functional.logsigmoid(rewards_j[:, -1] - rewards_k[:, -1]).mean()
+    return diff_val
 
 
-def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=False):
+def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=False, chat_data=False):
     # Shuffle indices
     len_warning_message = "[WARNING] Some sequences are longer than 2048 tokens. " \
                           "Consider pre-splitting your data to save memory."
@@ -186,8 +190,8 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                     b_lengths.append(len(bad_batch[-1]))
                 if max(max(p_lengths), max(b_lengths)) > 2048:
                     print(len_warning_message)
-                p_arr = np.zeros((batch_size, max(p_lengths)), np.int32)
-                b_arr = np.zeros((batch_size, max(b_lengths)), np.int32)
+                p_arr = np.ones((batch_size, max(p_lengths)), np.int32) * tok.pad_token_id
+                b_arr = np.ones((batch_size, max(b_lengths)), np.int32) * tok.pad_token_id
                 for j in range(batch_size):
                     p_arr[j, : p_lengths[j]] = pref_batch[j]
                     b_arr[j, : b_lengths[j]] = bad_batch[j]
@@ -210,6 +214,10 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                 input_ids = batch.clone()
                 input_ids[input_ids == -100] = tok.pad_token_id
                 labels = batch.clone()
+                if chat_data:
+                    labels = mask_between_sos(arr_in=labels, sos_token=1, mask_value=-100)
+                    labels = torch.tensor(labels)
+
                 yield input_ids, labels
 
         if not train_mode:
@@ -221,13 +229,17 @@ def evaluate(mdl, dataset, tok, train_args, device='mps'):
     ntokens = 0
     mdl.to(device)
     for it, batch in zip(
-        range(train_args.val_batches),
-        iterate_batches(dataset, tok, train_args.batch_size, reward_modeling=train_args.reward_model),
+            range(train_args.val_batches),
+            iterate_batches(dataset, tok, train_args.batch_size, reward_modeling=train_args.reward_model,
+                            chat_data=train_args.data_base == 'chat'),
     ):
         input_ids = batch[0].to(device)
         targets = batch[1].to(dtype=torch.long, device=device)
-        output = mdl(input_ids=input_ids, labels=targets)
-        all_losses.append(output.loss.item())
+        if train_args.reward_model:
+            loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
+        else:
+            loss = mdl(input_ids=input_ids, labels=targets).loss
+        all_losses.append(loss.item())
 
     return np.sum(all_losses) / max(ntokens, train_args.val_batches)
 
@@ -242,19 +254,25 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
     # Main training loop
     start = time.perf_counter()
     for it, batch in zip(
-        range(train_args.iters),
-        iterate_batches(train_ds, tok, train_args.batch_size,
-                        train_mode=True, reward_modeling=train_args.reward_model),
+            range(train_args.iters),
+            iterate_batches(train_ds, tok, train_args.batch_size,
+                            train_mode=True, reward_modeling=train_args.reward_model,
+                            chat_data=train_args.data_base == 'chat'),
     ):
         # Forward and backward pass
         input_ids = batch[0].to(device)
         targets = batch[1].to(dtype=torch.long, device=device)
-        output = mdl(input_ids=input_ids, labels=targets)
-        output.loss.backward()
+
+        # Use reward learning if applicable, else just use HF LM loss
+        if train_args.reward_model:
+            loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
+        else:
+            loss = mdl(input_ids=input_ids, labels=targets).loss
+        loss.backward()
         optimizer.step()
         optimizer.zero_grad()
         # Record loss
-        losses.append(output.loss.item())
+        losses.append(loss.item())
 
         # Report training loss if needed
         if (it + 1) % train_args.steps_per_report == 0:
@@ -314,6 +332,7 @@ if __name__ == "__main__":
         lora_dropout=0.01,
     )
     model = get_peft_model(model, config)
+    model.value_head = torch.nn.Linear(model.config.hidden_size, 1)
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_datasets(args)
@@ -322,9 +341,6 @@ if __name__ == "__main__":
     if args.resume_file is not None:
         print(f"Loading pretrained weights from {args.resume_file}")
         model.load_weights(args.resume_file, strict=False)
-
-    if args.reward_model:
-        loss_function = reward_loss
 
     if args.train:
         print("Training")
@@ -336,5 +352,7 @@ if __name__ == "__main__":
         train(model, train_set, valid_set, opt, tokenizer, args, device=DEVICE)
 
         # Save model
+        os.makedirs(args.save_file, exist_ok=True)
+        torch.save({'value_head': model.value_head.state_dict()}, args.save_file + '/value_head.pt')
         model = model.merge_and_unload()
         model.save_pretrained(args.save_file)

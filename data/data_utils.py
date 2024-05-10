@@ -61,7 +61,7 @@ def load_datasets(train_args):
     train_data, valid, test = [], [], []
     if 'chat' in ds_base:
         # To do me-chatbot, use 'chat' as data-base and '/path/to/your/message_data' as data
-        all_data = get_all_txts(train_args.data, reverse_query=False)
+        all_data = get_all_txts(train_args.data, reverse_query=train_args.reward_model)
         shuffle(all_data)
         valid_split_size = 1000
         train_data = all_data[:-valid_split_size]
