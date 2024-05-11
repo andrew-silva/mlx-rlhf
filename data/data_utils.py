@@ -52,7 +52,7 @@ class PrefDataset:
         return len(self._data)
 
 
-def load_datasets(train_args):
+def load_datasets(train_args, tokenizer=None):
     """
     Loads datasets in for training, assuming that reward-modeling datasets have "reward" in the name
     """
@@ -61,7 +61,13 @@ def load_datasets(train_args):
     train_data, valid, test = [], [], []
     if 'chat' in ds_base:
         # To do me-chatbot, use 'chat' as data-base and '/path/to/your/message_data' as data
-        all_data = get_all_txts(train_args.data, reverse_query=train_args.reward_model)
+        all_data = get_all_txts(
+            train_args.data,
+            tokenizer,
+            chunk_length=128,
+            prior_context_length=16,
+            reverse_query=train_args.reward_model
+        )
         shuffle(all_data)
         valid_split_size = 1000
         train_data = all_data[:-valid_split_size]

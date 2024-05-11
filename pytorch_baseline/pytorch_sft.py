@@ -19,6 +19,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 Example command for supervised fine-tuning with LoRA on generated data with a HF tiny llama
 python pytorch_sft.py --save-file sft_fine_tune --data-base increasing_mult_1_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train --iters 1500 --data ../data/
 
+python pytorch_sft.py --data ../../message_data/ --save-file sft_fine_tune/ --data-base chat --model meta-llama/Llama-2-7b-chat-hf --train --iters 15000 --batch-size 4 --steps-per-eval 1000
+
 Example command for training a reward model with LoRA on generated data with a HF tiny llama
 python pytorch_sft.py --reward-model --train --data-base reward_function_increasing_mult_2_ --batch-size 16 --save-file reward_lora.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 """
@@ -199,24 +201,34 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                 bad_batch = torch.tensor(b_arr)
                 yield pref_batch, bad_batch
             else:
-                batch = [tok.encode(dset[indices[i + j]]) for j in range(batch_size)]
-                lengths = [len(x) for x in batch]
-
-                # Check if any sequence is longer than 2048 tokens
-                if max(lengths) > 2048:
-                    print(len_warning_message)
-
-                # Pad to the max length
-                batch_arr = np.ones((batch_size, max(lengths)), np.int32) * -100
-                for j in range(batch_size):
-                    batch_arr[j, : lengths[j]] = batch[j]
-                batch = torch.tensor(batch_arr)
-                input_ids = batch.clone()
-                input_ids[input_ids == -100] = tok.pad_token_id
-                labels = batch.clone()
                 if chat_data:
-                    labels = mask_between_sos(arr_in=labels, sos_token=1, mask_value=-100)
-                    labels = torch.tensor(labels)
+                    batch = [dset[indices[i + j]] for j in range(batch_size)]
+                    input_ids = [x['input_ids'] for x in batch]
+                    labels = [x['labels'] for x in batch]
+                    lengths = [len(x['input_ids']) for x in batch]
+                    batch_arr = np.ones((batch_size, max(lengths)), np.int32) * tok.pad_token_id
+                    label_arr = np.ones_like(batch_arr) * -100
+                    for j in range(batch_size):
+                        batch_arr[j, : lengths[j]] = input_ids[j]
+                        label_arr[j, : lengths[j]] = labels[j]
+                    input_ids = torch.tensor(batch_arr)
+                    labels = torch.tensor(label_arr)
+                else:
+                    batch = [tok.encode(dset[indices[i + j]]) for j in range(batch_size)]
+                    lengths = [len(x) for x in batch]
+
+                    # Check if any sequence is longer than 2048 tokens
+                    if max(lengths) > 2048:
+                        print(len_warning_message)
+
+                    # Pad to the max length
+                    batch_arr = np.ones((batch_size, max(lengths)), np.int32) * -100
+                    for j in range(batch_size):
+                        batch_arr[j, : lengths[j]] = batch[j]
+                    batch = torch.tensor(batch_arr)
+                    input_ids = batch.clone()
+                    input_ids[input_ids == -100] = tok.pad_token_id
+                    labels = batch.clone()
 
                 yield input_ids, labels
 
@@ -268,9 +280,13 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
             loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
         else:
             loss = mdl(input_ids=input_ids, labels=targets).loss
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+        if not torch.isnan(loss):
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        else:
+            print(f'nan input ids: {input_ids}')
+            print(f'nan labels: {targets}')
         # Record loss
         losses.append(loss.item())
 
@@ -288,7 +304,7 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
             start = time.perf_counter()
 
         # Report validation loss if needed
-        if (it == 0 or (it + 1) % train_args.steps_per_eval == 0) and val_set is not None:
+        if ((it + 1) % train_args.steps_per_eval == 0) and val_set is not None:
             stop = time.perf_counter()
             val_loss = evaluate(
                 mdl, val_set, tok, train_args, device
@@ -324,6 +340,10 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model)
 
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token = tokenizer.eos_token
+
     config = LoraConfig(
         task_type="CAUSAL_LM",
         r=16,
@@ -335,7 +355,7 @@ if __name__ == "__main__":
     model.value_head = torch.nn.Linear(model.config.hidden_size, 1)
 
     print("Loading datasets")
-    train_set, valid_set, test_set = load_datasets(args)
+    train_set, valid_set, test_set = load_datasets(args, tokenizer)
 
     # Resume training the given weights.
     if args.resume_file is not None:

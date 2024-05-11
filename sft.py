@@ -371,7 +371,7 @@ if __name__ == "__main__":
     print(f"Trainable parameters {p:.3f}M")
 
     print("Loading datasets")
-    train_set, valid_set, test_set = load_datasets(args)
+    train_set, valid_set, test_set = load_datasets(args, tokenizer)
 
     if args.reward_model:
         loss_function = reward_loss

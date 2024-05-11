@@ -1,5 +1,6 @@
 import glob
 import re
+import numpy as np
 
 
 def parse_messages(file_path, reverse_query: bool = False):
@@ -26,6 +27,7 @@ def parse_messages(file_path, reverse_query: bool = False):
             # 1. "Responded to an earlier message" (replying in-line)
             # 2. Reactions?
             # 3. Dates inside of messages...
+            # 4. Images/websites
             current_message['text'] += line.strip() + ' '
 
     # Add the last message
@@ -52,14 +54,93 @@ def parse_messages(file_path, reverse_query: bool = False):
     return pairs
 
 
-def get_all_txts(message_dir, reverse_query: bool = False):
+def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_context_length: int = 32):
+    """
+    Given a bunch of pairs of messages <sender, me>, create <chunk_length> chunks with <prior_context_length> prior data
+    <sender> messages and <prior_context> should be labeled with -100
+    Don't shift labels before passing in.
+    Args:
+        chat_messages: <sender, me> tuples
+        tokenizer: Tokenizer to turn messages into tokens for accurate length trimming
+        chunk_length: int (default 512) -- How long should chunks be?
+        prior_context_length: int (default 32) -- How many tokens of prior context should be included in each chunk?
+
+    Returns:
+        List of <input_ids, label> pairs
+    """
+    chunks = []
+    current_chunk = {'input_ids': [], 'labels': []}
+    for sender, me in chat_messages:
+        sender_message = f'\nUser: {sender}\n'
+        me_message = f'System: {me}'
+        sender_tokens = tokenizer(sender_message)['input_ids']
+        me_tokens = tokenizer(me_message)['input_ids']
+
+        # Add prior context tokens if a previous chunk exists and if we have nothing yet in this chunk
+        if len(chunks) > 0 and len(current_chunk['input_ids']) == 0:
+            context_tokens = chunks[-1]['input_ids'][-prior_context_length:]
+            context_labels = [-100 for x in context_tokens]
+            current_chunk['input_ids'].extend(context_tokens)
+            current_chunk['labels'].extend(context_labels)
+
+        # Add sender tokens
+        if (chunk_length - len(current_chunk['input_ids'])) < len(sender_tokens):
+            # We can't fit the entire sender into our context
+            chunks.append(current_chunk)  # Add whatever we had before
+            current_chunk['input_ids'] = sender_tokens  # Add this message
+            current_chunk['labels'] = [-100 for x in sender_tokens]  # Add all -100s
+            if len(sender_tokens) >= chunk_length:
+                # If the sender alone is simply too big
+                chunks.append(current_chunk)  # Put it into the buffer, we'll delete it later
+                current_chunk = {'input_ids': [], 'labels': []}  # Reset the chunk to empty for the 'me' text
+        else:
+            current_chunk['input_ids'].extend(sender_tokens)
+            current_chunk['labels'].extend([-100] * len(sender_tokens))
+
+        # Add me tokens
+        max_ctx = max(0, chunk_length - len(current_chunk['input_ids']))
+        current_chunk['input_ids'].extend(me_tokens[:max_ctx])
+        current_chunk['labels'].extend(me_tokens[:max_ctx])
+
+        while max_ctx < len(me_tokens):
+            chunks.append(current_chunk)
+            current_chunk = {
+                'input_ids': current_chunk['input_ids'][-prior_context_length:],
+                'labels': [-100] * prior_context_length
+            }
+            me_tokens = me_tokens[max_ctx:]
+            max_ctx = max(0, chunk_length - len(current_chunk['input_ids']))  # == chunk_length-prior_context_length
+            current_chunk['input_ids'].extend(me_tokens[max_ctx:])
+            current_chunk['labels'].extend(me_tokens[max_ctx:])
+
+        # If the current chunk is full, add it to the list of chunks
+        if len(current_chunk['input_ids']) >= chunk_length:
+            chunks.append(current_chunk)
+            current_chunk = {'input_ids': [], 'labels': []}
+
+    # Add the last incomplete chunk
+    if current_chunk['input_ids']:
+        chunks.append(current_chunk)
+
+    del_inds = []
+    for c_ind in range(len(chunks)):
+        if np.all(np.array(chunks[c_ind]['labels']) == -100):
+            del_inds.append(c_ind)
+    for d in del_inds[::-1]:
+        del chunks[d]
+    return chunks
+
+
+def get_all_txts(message_dir, tokenizer, chunk_length=512, prior_context_length=32, reverse_query: bool = False):
     dataset = []
     for fn in glob.glob(f'{message_dir}/*.txt'):
         if ',' in fn.split('/')[-1]:
             # Not dealing with group chats
             continue
         chat_messages = parse_messages(fn, reverse_query)
-        dataset.extend(chat_messages)
+        if len(chat_messages) > 0:
+            chat_chunks = densify_chat(chat_messages, tokenizer, chunk_length, prior_context_length)
+            dataset.extend(chat_chunks)
     return dataset
 
 
