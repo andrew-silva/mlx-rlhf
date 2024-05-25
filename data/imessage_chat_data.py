@@ -54,6 +54,13 @@ def parse_messages(file_path, reverse_query: bool = False):
     return pairs
 
 
+def mask_out_system_prompt(labels_in, masked_prompt, mask_int=-100):
+    """Given a label list, set all of the 'System: ' tokens to -100 so that we don't learn to say that."""
+    labels_in = np.array(labels_in)
+    labels_in[labels_in == masked_prompt] = mask_int
+    return labels_in.tolist()
+
+
 def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_context_length: int = 32):
     """
     Given a bunch of pairs of messages <sender, me>, create <chunk_length> chunks with <prior_context_length> prior data
@@ -70,11 +77,15 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
     """
     chunks = []
     current_chunk = {'input_ids': [], 'labels': []}
+    sys_prompt = 'System: '
+    masked_out_tokens = np.array(tokenizer(sys_prompt)['input_ids'])
     for sender, me in chat_messages:
         sender_message = f'\nUser: {sender}\n'
-        me_message = f'System: {me}'
+        me_message = f'{sys_prompt}{me}'
+        # TODO: If this is a reward function... generate the alternate responses via LLM? idk...
         sender_tokens = tokenizer(sender_message)['input_ids']
         me_tokens = tokenizer(me_message)['input_ids']
+
 
         # Add prior context tokens if a previous chunk exists and if we have nothing yet in this chunk
         if len(chunks) > 0 and len(current_chunk['input_ids']) == 0:
@@ -91,6 +102,9 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
             current_chunk['labels'] = [-100 for x in sender_tokens]  # Add all -100s
             if len(sender_tokens) >= chunk_length:
                 # If the sender alone is simply too big
+                current_chunk['labels'] = mask_out_system_prompt(labels_in=current_chunk['labels'],
+                                                                 masked_prompt=masked_out_tokens,
+                                                                 mask_int=-100)
                 chunks.append(current_chunk)  # Put it into the buffer, we'll delete it later
                 current_chunk = {'input_ids': [], 'labels': []}  # Reset the chunk to empty for the 'me' text
         else:
@@ -115,11 +129,17 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
 
         # If the current chunk is full, add it to the list of chunks
         if len(current_chunk['input_ids']) >= chunk_length:
+            current_chunk['labels'] = mask_out_system_prompt(labels_in=current_chunk['labels'],
+                                                             masked_prompt=masked_out_tokens,
+                                                             mask_int=-100)
             chunks.append(current_chunk)
             current_chunk = {'input_ids': [], 'labels': []}
 
     # Add the last incomplete chunk
     if current_chunk['input_ids']:
+        current_chunk['labels'] = mask_out_system_prompt(labels_in=current_chunk['labels'],
+                                                         masked_prompt=masked_out_tokens,
+                                                         mask_int=-100)
         chunks.append(current_chunk)
 
     del_inds = []
@@ -131,19 +151,44 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
     return chunks
 
 
-def get_all_txts(message_dir, tokenizer, chunk_length=512, prior_context_length=32, reverse_query: bool = False):
+def find_index_of_second_targets(labels, target_label: int = -100):
+    """
+    Given a set of targets like [-100, -100, 2, 3, 1, -100, -100], find the first -100 after a set of positive numbers
+    Args:
+        labels: list of targets
+        target_label: int to search for
+    Returns:
+        index of the target integer's first appearance after non-target numbers or -1 if there was no second target
+    """
+    last_positive_index = -1
+    for i, label in enumerate(labels):
+        if label != target_label:
+            last_positive_index = i
+        elif last_positive_index != -1:
+            return i
+    return -1
+
+
+def get_all_txts(message_dir, tokenizer, chunk_length=512, prior_context_length=32, reward_function: bool = False):
     dataset = []
     for fn in glob.glob(f'{message_dir}/*.txt'):
         if ',' in fn.split('/')[-1]:
             # Not dealing with group chats
             continue
-        chat_messages = parse_messages(fn, reverse_query)
+        chat_messages = parse_messages(fn)
         if len(chat_messages) > 0:
-            chat_chunks = densify_chat(chat_messages, tokenizer, chunk_length, prior_context_length)
-            dataset.extend(chat_chunks)
+            if not reward_function:
+                chat_chunks = densify_chat(chat_messages, tokenizer, chunk_length, prior_context_length)
+                dataset.extend(chat_chunks)
+            else:
+                chat_chunks = densify_chat(chat_messages, tokenizer, chunk_length, prior_context_length)
+                # Split chunks based on -100s...
+                #
+                dataset.extend(chat_chunks)
+
     return dataset
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
     # Wherever you run `imessage-exporter -f txt -o message_data`
-    dataset = get_all_txts('/Users/andrewsilva/Projects/research/code/tinkerings/message_data/', reverse_query=True)
+    # dataset = get_all_txts('/Users/andrewsilva/Projects/research/code/tinkerings/message_data/')

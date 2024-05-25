@@ -19,10 +19,16 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 Example command for supervised fine-tuning with LoRA on generated data with a HF tiny llama
 python pytorch_sft.py --save-file sft_fine_tune --data-base increasing_mult_1_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train --iters 1500 --data ../data/
 
+Step 1: Creating a model that is already prepared to do digit generation and then needs to be fine-tuned for even digits
+python pytorch_sft.py --save-file digit_fine_tune --data-base increasing_mult_1_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train --iters 20000 --data ../data/ --batch-size 32
+Step 2: Fine tuning to prepare for even-digit generation
+python pytorch_sft.py --save-file even_digit_fine_tune --data-base increasing_mult_2_ --model ./digit_fine_tune/ --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train --iters 50 --data ../data/ --batch-size 32
+Step 3: Learning a reward model from preference data
+python pytorch_sft.py --reward-model --train --data-base reward_function_increasing_mult_2_  --save-file even_reward_model --model ./digit_fine_tune/ --iters 20000 --data ../data/ --batch-size 32 --steps-per-eval 21000
+
+Learning a fine-tuned me-chatbot
 python pytorch_sft.py --data ../../message_data/ --save-file sft_fine_tune/ --data-base chat --model meta-llama/Llama-2-7b-chat-hf --train --iters 15000 --batch-size 4 --steps-per-eval 1000
 
-Example command for training a reward model with LoRA on generated data with a HF tiny llama
-python pytorch_sft.py --reward-model --train --data-base reward_function_increasing_mult_2_ --batch-size 16 --save-file reward_lora.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 """
 
 
@@ -32,6 +38,11 @@ def build_parser():
         "--model",
         default="model",
         help="The path to the local model directory or Hugging Face repo.",
+    )
+    arg_parse.add_argument(
+        "--tokenizer",
+        default=None,
+        help="The path to the tokenizer we want to use. If none, use args.model.",
     )
     # Generation args
     arg_parse.add_argument(
@@ -163,7 +174,6 @@ def reward_loss(mdl, better_inputs, worse_inputs):
 
     output = mdl(worse_inputs, output_hidden_states=True)
     rewards_k = mdl.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
-
     # Batch x SeqLen x OutputDim -- get last token value
     diff_val = -torch.nn.functional.logsigmoid(rewards_j[:, -1] - rewards_k[:, -1]).mean()
     return diff_val
@@ -317,6 +327,15 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
             val_losses.append(val_loss)
 
             start = time.perf_counter()
+
+        # if (it+1) % train_args.save_every == 0:
+        #     os.makedirs(args.save_file, exist_ok=True)
+        #     torch.save({'value_head': mdl.value_head.state_dict()}, train_args.save_file + '/value_head.pt')
+        #     save_model = mdl.merge_and_unload()
+        #     save_model.save_pretrained(args.save_file)
+        #     save_model = None
+        #     del save_model
+
     fn = ''
     if train_args.prompt_tuning:
         fn += 'prompt_tuning_'
@@ -337,7 +356,7 @@ if __name__ == "__main__":
     DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
     print("Loading pretrained model")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer if args.tokenizer is not None else args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model)
 
     if tokenizer.pad_token_id is None:
@@ -348,7 +367,7 @@ if __name__ == "__main__":
         task_type="CAUSAL_LM",
         r=16,
         lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["q_proj", "v_proj"],  # ['query_key_value'],  #
         lora_dropout=0.01,
     )
     model = get_peft_model(model, config)

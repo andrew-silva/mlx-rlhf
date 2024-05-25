@@ -36,6 +36,7 @@ from transformers import HfArgumentParser
 from mlx.utils import tree_flatten
 from mlx_ppo_trainer import PPOTrainer
 from data.digit_seq_rewards import RewardFunction
+from data.data_utils import get_all_txts
 import utils
 
 from models.config import PPOConfig
@@ -81,10 +82,10 @@ def main(args_in, ppo_config_in):
     p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10 ** 6
     print(f"Trainable parameters {p:.3f}M")
 
-    # Some tokenizers like GPT-2's don't have a padding token by default, so we set one here.
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
 
     # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
     ppo_trainer = PPOTrainer(ppo_config_in, model, ref_model, tokenizer, data_collator=collator)
@@ -99,25 +100,29 @@ def main(args_in, ppo_config_in):
     # We then define the arguments to pass to the `generate` function. These arguments
     # are passed to the `generate` function of the PPOTrainer, which is a wrapper around
     # the `generate` function of the trained model.
-    # TODO: play with generation kwargs, might help exploration
     generation_kwargs = {
-        "min_length": -1,
-        "top_k": 0.0,
-        "top_p": 1.0,
-        "do_sample": True,
+        # "min_length": -1,
+        # "top_k": 0.0,
+        # "top_p": 1.0,
+        # "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id,
-        "max_new_tokens": 20,
+        "max_new_tokens": 24,
     }
 
+    if args_in.me_chatbot:
+        train_set = get_all_txts('../../message_data/', tokenizer=tokenizer)
+
     # TODO: add a command-line arg for num-steps
-    for epoch in range(10000):
+    for epoch in range(5500):
         # TODO: Add a command-line arg for a prompt before each call?
-        # text_in = 'Count up even numbers 2 8 20'
-        # text_in = ''
         text_in = []
         for _ in range(ppo_config_in.batch_size):
-            start_int = random.randint(0, 10) * 2
-            text_in.append(f'{start_int}')
+
+            if args_in.me_chatbot:
+                text_in.append(random.choice(train_set)[0])
+            else:
+                start_int = random.randint(0, 150) * 2
+                text_in.append(f'{start_int}')
 
         batch = {
             'query': text_in,
@@ -185,6 +190,8 @@ if __name__ == "__main__":
         resume_file: Optional[str] = field(default=None,
                                            metadata={"help": "Load path for the trained PEFT weights."})
         prompt_tuning: bool = field(default=False, metadata={"help": "whether to use prompt-tuning or LoRA"})
+        me_chatbot: bool = field(default=False, metadata={'help': 'Set prompts as samples from my imessage history?'})
+        num_steps: Optional[int] = field(default=5550, metadata={'help': 'How many PPO training iterations should we use?'})
 
 
     parser = HfArgumentParser((ScriptArguments, PPOConfig))

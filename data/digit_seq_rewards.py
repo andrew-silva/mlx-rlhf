@@ -19,11 +19,14 @@ class RewardFunction:
     def check_multiple_of(self, num):
         return num % self.multiple_of == 0
 
-    def __call__(self, input_str_batch, negated=False):
+    def __call__(self, input_str_batch, query=None, negated=False):
         if type(input_str_batch) is str:
             input_str_batch = [input_str_batch]
         scores = []
-        for input_str in input_str_batch:
+        if query is None:
+            query = ['' for _ in range(len(input_str_batch))]
+        for input_str, q in zip(input_str_batch, query):
+            q_words = q.split()
             words = input_str.split()
 
             if not words:
@@ -32,7 +35,13 @@ class RewardFunction:
                 return 0.0
 
             count_matches = 0
-            current_pattern = []
+
+            try:
+                current_pattern = [int(q_words[-1])]
+            except ValueError:
+                current_pattern = []
+            except IndexError:
+                current_pattern = []
 
             for word in words:
                 try:
@@ -55,6 +64,8 @@ class RewardFunction:
                         else:
                             current_pattern.append(num)
                             count_matches += 1
+                    else:
+                        break
                 except ValueError:
                     # Ignore non-integer words
                     pass
@@ -114,7 +125,7 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
 
 if __name__ == "__main__":
     reward_fn = RewardFunction(is_increasing=True, multiple_of=2)
-    input_string = "4 8 12 22 28 99"
+    input_string = "4 -90 -90 -90 8 12 22 28 99"
     percent_matching = reward_fn(input_string)
     print(f'String: {input_string} reward: {percent_matching}')
     gen_data = generate_synthetic_data(reward_function=reward_fn,

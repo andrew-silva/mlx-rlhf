@@ -231,23 +231,32 @@ def iterate_batches(dset, tok, batch_size, train_mode=False, reward_modeling=Fal
                 bad_batch = mx.array(b_arr)
                 yield pref_batch, bad_batch
             else:
-                batch = [tok.encode(dset[indices[i + j]]) for j in range(batch_size)]
-                lengths = [len(x) for x in batch]
-
-                # Check if any sequence is longer than 2048 tokens
-                if max(lengths) > 2048:
-                    print(len_warning_message)
-
-                # Pad to the max length
-                batch_arr = np.zeros((batch_size, max(lengths)), np.int32)
-
-                for j in range(batch_size):
-                    batch_arr[j, : lengths[j]] = batch[j]
-                batch = mx.array(batch_arr)
                 if chat_data:
-                    targets = mask_between_sos(arr_in=batch, sos_token=1, mask_value=-100)
-                    targets = mx.array(targets)
+                    batch = [dset[indices[i + j]] for j in range(batch_size)]
+                    input_ids = [x['input_ids'] for x in batch]
+                    labels = [x['labels'] for x in batch]
+                    lengths = [len(x['input_ids']) for x in batch]
+                    batch_arr = np.ones((batch_size, max(lengths)), np.int32) * tok.pad_token_id
+                    label_arr = np.ones_like(batch_arr) * -100
+                    for j in range(batch_size):
+                        batch_arr[j, : lengths[j]] = input_ids[j]
+                        label_arr[j, : lengths[j]] = labels[j]
+                    batch = mx.array(batch_arr)
+                    targets = mx.array(label_arr)
                 else:
+                    batch = [tok.encode(dset[indices[i + j]]) for j in range(batch_size)]
+                    lengths = [len(x) for x in batch]
+
+                    # Check if any sequence is longer than 2048 tokens
+                    if max(lengths) > 2048:
+                        print(len_warning_message)
+
+                    # Pad to the max length
+                    batch_arr = np.zeros((batch_size, max(lengths)), np.int32)
+
+                    for j in range(batch_size):
+                        batch_arr[j, : lengths[j]] = batch[j]
+                    batch = mx.array(batch_arr)
                     targets = batch
                 yield batch[:, :-1], targets[:, 1:], mx.array(lengths)
 
@@ -353,7 +362,6 @@ if __name__ == "__main__":
     model, tokenizer, _ = utils.load(args.model)
 
     # Freeze all layers other than PEFT weights
-    # TODO: model.freeze() is probably freezing my value head, which I need for reward modeling >.<
     model.freeze()
     model.v_head.unfreeze()
     if args.prompt_tuning:

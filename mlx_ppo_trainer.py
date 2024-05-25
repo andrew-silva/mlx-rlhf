@@ -459,6 +459,12 @@ class PPOTrainer:
                 return_logits=full_kl_penalty,
             )
 
+        values = mx.stop_gradient(values)
+        all_logprobs = mx.stop_gradient(all_logprobs)
+        logits_or_none = mx.stop_gradient(logits_or_none) if logits_or_none is not None else None
+        ref_logprobs = mx.stop_gradient(ref_logprobs)
+        ref_logits_or_none = mx.stop_gradient(ref_logits_or_none) if ref_logits_or_none is not None else None
+
         timing["time/ppo/forward_pass"] = time.time() - t
 
         # with torch.no_grad():
@@ -473,6 +479,8 @@ class PPOTrainer:
         else:
             rewards, non_score_reward, kls = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
         timing["time/ppo/compute_rewards"] = time.time() - t
+
+        rewards = mx.stop_gradient(rewards)
 
         t = time.time()
         values, advantages, returns = self.compute_advantages(values, rewards, masks)
@@ -844,6 +852,7 @@ class PPOTrainer:
         advantages = mx.stack(advantages_reversed[::-1]).transpose()
         returns = advantages + values
         advantages = masked_whiten(advantages, mask)
+        advantages = mx.stop_gradient(advantages)
         return values, advantages, returns
 
     def loss_fn(

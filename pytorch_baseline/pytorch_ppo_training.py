@@ -17,6 +17,9 @@
 """
 Example call to use a pre-trained LoRA from sft for RLHF with ground-truth reward:
 python ppo_training.py --log_with=wandb --resume_file pytorch_model --ground_truth_reward
+python ppo_training.py --model ./even_digit_fine_tune/ --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --log_with wandb --ground_truth_reward --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 --num_steps 5550 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 7
+python ppo_training.py --model ./even_digit_fine_tune/ --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --log_with wandb --reward_model_dir ./even_reward_model/ --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 --num_steps 2550 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 17
+
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -63,13 +66,15 @@ def main(args_in, ppo_config_in):
     else:
         model = AutoModelForCausalLM.from_pretrained(args_in.model)
 
-    tokenizer = AutoTokenizer.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0')
+    # tokenizer = AutoTokenizer.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0')
+    tokenizer = AutoTokenizer.from_pretrained(args_in.tokenizer if args_in.tokenizer is not None else args_in.model)
+    tokenizer.padding_side = 'left'
 
     config = LoraConfig(
         task_type="CAUSAL_LM",
         r=16,
         lora_alpha=16,
-        target_modules=["q_proj", "v_proj"],
+        target_modules=["q_proj", "v_proj"],   # ["q_proj", "v_proj"], ['query_key_value'],
         lora_dropout=0.01,
     )
     model = get_peft_model(model, config)
@@ -103,26 +108,29 @@ def main(args_in, ppo_config_in):
     # the `generate` function of the trained model.
     # TODO: play with generation kwargs, might help exploration
     generation_kwargs = {
-        "min_length": -1,
-        "top_k": 0.0,
-        "top_p": 1.0,
-        "do_sample": True,
+        # "min_length": -1,
+        # "top_k": 0.0,
+        # "top_p": 1.0,
+        # "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id,
-        "max_new_tokens": 20,
+        "max_new_tokens": 24,
     }
 
-    train_set = get_all_txts('../../message_data/', reverse_query=False)
-
+    if args_in.me_chatbot:
+        train_set = get_all_txts('../../message_data/', tokenizer=tokenizer)
 
     # TODO: add a command-line arg for num-steps
-    for epoch in range(10000):
+    for epoch in range(5500):
         # TODO: Add a command-line arg for a prompt before each call?
-        # text_in = 'Count up even numbers 2 8 20'
+        # text_in = 'Count up even numbers: '
         text_in = []
         for _ in range(ppo_config_in.batch_size):
-            # start_int = random.randint(0, 10) * 2
-            # text_in.append(f'{start_int}')
-            text_in.append(random.choice(train_set)[0])
+
+            if args_in.me_chatbot:
+                text_in.append(random.choice(train_set)[0])
+            else:
+                start_int = random.randint(0, 150) * 2
+                text_in.append(f'{start_int}')
 
         batch = {
             'query': text_in,
@@ -136,12 +144,14 @@ def main(args_in, ppo_config_in):
             query_tensors, return_prompt=False, generate_ref_response=True, **generation_kwargs
         )
 
+        response_tensors = torch.stack([x[len(y):] for x, y in zip(response_tensors, query_tensors)])
+        ref_response_tensors = torch.stack([x[len(y):] for x, y in zip(ref_response_tensors, query_tensors)])
         batch["response"] = tokenizer.batch_decode(np.array(response_tensors.cpu()))
         batch["ref_response"] = tokenizer.batch_decode(np.array(ref_response_tensors.cpu()))
 
         if args_in.ground_truth_reward:
-            scores = reward_function(batch['response'], negated=False)  # Should we omit query in the scoring?
-            ref_scores = reward_function(batch['ref_response'], negated=False)
+            scores = torch.tensor(reward_function(batch['response'], query=batch['query'], negated=False))
+            ref_scores = torch.tensor(reward_function(batch['ref_response'], query=batch['query'], negated=False))
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
         else:
             with torch.no_grad():
@@ -152,14 +162,41 @@ def main(args_in, ppo_config_in):
             scores = scores[:, -1]
             ref_scores = ref_scores[:, -1]
 
+        # Score filtering
+        # query_tensors = query_tensors[scores != 0]
+        # response_tensors = response_tensors[scores != 0]
+        # ref_response_tensors = ref_response_tensors[scores != 0]
+        # saved_queries = []
+        # saved_responses = []
+        # saved_ref_resposnes = []
+        # for ind in np.arange(len(scores))[scores != 0]:
+        #     saved_queries.append(batch['query'][ind])
+        #     saved_responses.append(batch['response'][ind])
+        #     saved_ref_resposnes.append(batch['ref_response'][ind])
+        # batch['query'] = saved_queries
+        # batch['response'] = saved_responses
+        # batch['ref_response'] = saved_ref_resposnes
+        #
+        # ref_scores = ref_scores[scores != 0]
+        # scores = scores[scores != 0]
+        # End score filtering
+
         rewards = scores  # .unsqueeze(1)?
 
         batch["ref_rewards"] = ref_scores
 
         # Run PPO step
-        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
-        ppo_trainer.log_stats(stats, batch, rewards,
-                              columns_to_log=["query", "response", "ref_response", "ref_rewards"])
+        if len(rewards.size()) > 0 and rewards.size(0) > 1:
+            ppo_trainer.config.batch_size = rewards.size(0)
+            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+            ppo_trainer.log_stats(stats, batch, rewards,
+                                  columns_to_log=["query", "response", "ref_response", "ref_rewards"])
+
+            # logs = {}
+            # logs["env/reward_mean"] = torch.mean(rewards.cpu().detach()).item()
+            # logs["env/reward_std"] = torch.var(rewards.cpu().detach()).sqrt().item()
+            # logs["env/reward_dist"] = np.array(rewards.cpu().detach())
+            # ppo_trainer.logger.log(logs)
     # Save prompt weights
     model.save_pretrained(args_in.save_file)
 
@@ -175,15 +212,19 @@ if __name__ == "__main__":
         num_prompt_tokens: Optional[int] = field(default=10, metadata={"help": "the number of prompt tokens"})
         model: Optional[str] = field(default=None,
                                      metadata={"help": "The path to the local model directory or Hugging Face repo"})
+        tokenizer: Optional[str] = field(default=None,
+                                         metadata={'help': 'Path to the hugging face tokenizer that accompanies the given model'})
         reward_model_dir: Optional[str] = field(default=None,
                                             metadata={
                                                 "help": "The path to the local model directory or Hugging Face repo"})
 
-        save_file: str = field(default="peft_weights.npz",
+        save_file: str = field(default="rl_tuned_model",
                                metadata={"help": "Save path for the trained PEFT weights."})
         resume_file: Optional[str] = field(default=None,
                                            metadata={"help": "Load path for the trained PEFT weights."})
         prompt_tuning: bool = field(default=False, metadata={"help": "whether to use prompt-tuning or LoRA"})
+        me_chatbot: bool = field(default=False, metadata={'help': 'Set prompts as samples from my imessage history?'})
+        num_steps: Optional[int] = field(default=5550, metadata={'help': 'How many PPO training iterations should we use?'})
 
 
     parser = HfArgumentParser((ScriptArguments, PPOConfig))

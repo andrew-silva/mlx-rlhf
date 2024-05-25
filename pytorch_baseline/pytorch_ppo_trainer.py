@@ -253,6 +253,7 @@ class PPOTrainer:
                                     eos_token_id=self.tokenizer.eos_token_id,
                                     temperature=0.0,
                                     max_tokens=generation_kwargs['max_new_tokens'])
+            # response = self.model.generate(input_ids=query_tensor, **generation_kwargs)
             if generate_ref_response:
                 with self.optional_peft_ctx():
                     ref_response = generate_ids(
@@ -262,6 +263,7 @@ class PPOTrainer:
                         temperature=0.0,
                         max_tokens=generation_kwargs['max_new_tokens']
                     )
+                    # ref_response = ref_model.generate(input_ids=query_tensor, **generation_kwargs)
 
         if generate_ref_response:
             return response, ref_response
@@ -350,7 +352,7 @@ class PPOTrainer:
         """
         for name, tensor_list in zip(["queries", "responses", "scores"], [queries, responses, scores]):
             if not isinstance(tensor_list[0], torch.Tensor):
-                raise ValueError(f"Elements in {name} must be mx.array - got {type(tensor_list[0])}")
+                raise ValueError(f"Elements in {name} must be Tensor - got {type(tensor_list[0])}")
             if batch_size is not None and len(tensor_list) != batch_size:
                 raise ValueError(
                     f"Batch size ({batch_size}) does not match number of examples - but got {len(tensor_list)} for: {name}"
@@ -432,42 +434,41 @@ class PPOTrainer:
 
         full_kl_penalty = self.config.kl_penalty == "full"
 
-        # with torch.no_grad():
-        all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
-            self.model,
-            queries,
-            responses,
-            model_inputs,
-            response_masks=response_masks,
-            return_logits=full_kl_penalty,
-        )
-        with self.optional_peft_ctx():
-            ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
-                self.model if self.is_peft_model else self.ref_model,
+        with torch.no_grad():
+            all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
+                self.model,
                 queries,
                 responses,
                 model_inputs,
+                response_masks=response_masks,
                 return_logits=full_kl_penalty,
             )
+            with self.optional_peft_ctx():
+                ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
+                    self.model if self.is_peft_model else self.ref_model,
+                    queries,
+                    responses,
+                    model_inputs,
+                    return_logits=full_kl_penalty,
+                )
 
-        timing["time/ppo/forward_pass"] = time.time() - t
+            timing["time/ppo/forward_pass"] = time.time() - t
 
-        # with torch.no_grad():
-        t = time.time()
-        if full_kl_penalty:
-            active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
-            ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
+            t = time.time()
+            if full_kl_penalty:
+                active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
+                ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
 
-            rewards, non_score_reward, kls = self.compute_rewards(
-                scores, active_full_logprobs, ref_full_logprobs, masks
-            )
-        else:
-            rewards, non_score_reward, kls = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
-        timing["time/ppo/compute_rewards"] = time.time() - t
+                rewards, non_score_reward, kls = self.compute_rewards(
+                    scores, active_full_logprobs, ref_full_logprobs, masks
+                )
+            else:
+                rewards, non_score_reward, kls = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
+            timing["time/ppo/compute_rewards"] = time.time() - t
 
-        t = time.time()
-        values, advantages, returns = self.compute_advantages(values, rewards, masks)
-        timing["time/ppo/compute_advantages"] = time.time() - t
+            t = time.time()
+            values, advantages, returns = self.compute_advantages(values, rewards, masks)
+            timing["time/ppo/compute_advantages"] = time.time() - t
 
         # upcast to float32 to avoid dataset issues
         batch_dict = {
@@ -661,7 +662,7 @@ class PPOTrainer:
                 response_masks_batch = response_masks[i * fbs: (i + 1) * fbs]
             output = model(**input_kwargs, output_hidden_states=True)
             logits = output.logits
-            values = model.value_head(output.hidden_states[-1][:, :, :]).squeeze(-1)
+            values = model.value_head(output.hidden_states[-1][:, :, :].clone().detach()).squeeze(-1)
             input_ids = torch.tensor(input_kwargs["input_ids"])
             attention_mask = torch.tensor(input_kwargs["attention_mask"])
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
@@ -812,7 +813,7 @@ class PPOTrainer:
             return 0.5 * (logprob - ref_logprob).square()
 
         if self.config.kl_penalty == "full":
-            return torch.nn.functional.kl_div(ref_logprob, logprob, log_target=True, reduction="none")  # .sum(-1)
+            return torch.nn.functional.kl_div(ref_logprob, logprob, log_target=True, reduction="none").sum(-1)
 
         raise NotImplementedError
 
@@ -825,6 +826,7 @@ class PPOTrainer:
         lastgaelam = 0
         advantages_reversed = []
         gen_len = rewards.shape[-1]
+        # returns = torch.zeros_like(values)
 
         values = values * mask
         rewards = rewards * mask
@@ -835,11 +837,13 @@ class PPOTrainer:
             delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
             lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
             advantages_reversed.append(lastgaelam)
+            # returns[:, t] = rewards[:, t] + (self.config.gamma * returns[:, t + 1] if t < gen_len - 1 else 0)
         advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
 
-        returns = advantages + values
+        returns = advantages + values  # This is how SB3 does it, but it seems wrong???
 
         advantages = masked_whiten(advantages, mask)
+        advantages = advantages.detach()
         return values, advantages, returns
 
     def loss_fn(

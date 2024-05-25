@@ -9,12 +9,12 @@ if __name__ == "__main__":
     arg_parse = argparse.ArgumentParser(description="Talk to a trained model.")
     arg_parse.add_argument(
         "--model",
-        default="./sft_fine_tune/",
+        default="./even_digit_fine_tune/",
         help="The path to the local model directory or Hugging Face repo.",
     )
     arg_parse.add_argument(
         "--tokenizer",
-        default="meta-llama/Llama-2-7b-chat-hf",
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # "meta-llama/Llama-2-7b-chat-hf",
         help="The path to the local model directory or Hugging Face repo.",
     )
     # Generation args
@@ -22,11 +22,18 @@ if __name__ == "__main__":
         "--max-tokens",
         "-m",
         type=int,
-        default=128,
+        default=32,
         help="The maximum number of tokens to generate",
     )
     arg_parse.add_argument(
-        "--temp", type=float, default=0.1, help="The sampling temperature"
+        "--max-context",
+        '-c',
+        type=int,
+        default=1024,
+        help="The maximum number of tokens from the ongoing conversation that should be wrapped up as context"
+    )
+    arg_parse.add_argument(
+        "--temp", type=float, default=0.0, help="The sampling temperature"
     )
     args = arg_parse.parse_args()
 
@@ -39,13 +46,15 @@ if __name__ == "__main__":
     while True:
         input_str = input(">>>")
         input_message = f'{output_message}\nUser: {input_str}\nSystem:'
+        input_message = input_str
         input_message = tokenizer(input_message)
+        input_message = input_message['input_ids'][-args.max_context:]
         with torch.no_grad():
             output_message = model.generate(
-                input_ids=torch.tensor(input_message['input_ids'], device=DEVICE).unsqueeze(0),
+                input_ids=torch.tensor(input_message, device=DEVICE).unsqueeze(0),
                 max_new_tokens=args.max_tokens,
                 temperature=args.temp
             )
-        output_message = tokenizer.decode(output_message[0, len(input_message['input_ids']):])
-        output_message = output_message.split('User:')[0]
-        print(f'Bot: {output_message}')
+        output_message = tokenizer.decode(output_message[0, len(input_message):])
+        output_message = f'System: {output_message.split("User:")[0].split("</s>")[0]}'
+        print(f'{output_message}')
