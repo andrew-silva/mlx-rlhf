@@ -3,12 +3,11 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
-import json
 import math
 import time
-import random
+from typing import Union
 from pathlib import Path
-from data.data_utils import load_datasets, mask_between_sos
+from data.data_utils import load_datasets
 import matplotlib.pyplot as plt
 
 import mlx.core as mx
@@ -17,15 +16,22 @@ import mlx.optimizers as optim
 import numpy as np
 import utils
 from mlx.utils import tree_flatten
+from mlx_lm.tuner.utils import linear_to_lora_layers
+from mlx_lm.utils import load as mlx_lm_load_model
 from models.prompt_tuning import PromptTuning
-from models.lora import LoRALinear
 
 """
 Example command for supervised fine-tuning with soft-prompts on generated data with a locally saved tiny llama:
 python sft.py --prompt-tuning --save-file prompt_weights.npz --data-base increasing_mult_2_ --model ../tiny_llama --train
 
-Example command for supervised fine-tuning with LoRA on generated data with a HF tiny llama
-python sft.py --save-file lora_weights.npz --data-base increasing_mult_2_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train
+Step 1: Creating a model that is already prepared to do digit generation and then needs to be fine-tuned for even digits
+python sft.py --save-file digit_fine_tune.npz --data-base increasing_mult_1_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --train --iters 20000 --data ./data/ --batch-size 32 --steps-per-eval 21000
+Step 2: Fine tuning to prepare for even-digit generation
+python sft.py --save-file even_digit_fine_tune.npz --data-base increasing_mult_2_ --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --resume-file digit_fine_tune.npz --train --iters 50 --data ./data/ --batch-size 32
+Step 3: Learning a reward model from preference data
+python pytorch_sft.py --reward-model --train --data-base reward_function_increasing_mult_2_  --save-file even_reward_model --model ./digit_fine_tune/ --iters 20000 --data ../data/ --batch-size 32 --steps-per-eval 21000
+
+
 
 Example command for training a reward model with LoRA on generated data with a HF tiny llama
 python sft.py --reward-model --train --data-base reward_function_increasing_mult_2_ --batch-size 16 --save-file reward_lora.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -163,7 +169,7 @@ def loss(mdl, inputs, targets, lengths):
         Loss value, tokens-per-second
     """
     # Run model on inputs
-    logits, _, _ = mdl(inputs)
+    logits = mdl(inputs)
     logits = logits.astype(mx.float32)
 
     # Mask padding tokens
@@ -279,6 +285,14 @@ def evaluate(mdl, dataset, loss_fn, tok, train_args):
     return np.sum(all_losses) / max(ntokens, train_args.val_batches)
 
 
+def save_adapter(
+    save_model: nn.Module,
+    adapter_file: Union[str, Path],
+):
+    flattened_tree = tree_flatten(save_model.trainable_parameters())
+    mx.save_safetensors(str(adapter_file), dict(flattened_tree))
+
+
 def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
     # Create value and grad function for loss
     loss_value_and_grad = nn.value_and_grad(mdl, loss_fn)
@@ -337,10 +351,15 @@ def train(mdl, train_ds, val_set, optimizer, loss_fn, tok, train_args):
 
         # Save prompt weights if needed
         if (it + 1) % train_args.save_every == 0:
-            mx.savez(
-                train_args.save_file, **dict(tree_flatten(mdl.trainable_parameters()))
+            save_adapter(model, train_args.save_file)
+            checkpoint = (
+                    Path(train_args.save_file).parent / f"{it:07d}_adapters.safetensors"
             )
-            print(f"Iter {it + 1}: Saved PEFT weights to {train_args.save_file}.")
+            save_adapter(model, checkpoint)
+            print(
+                f"Iter {it}: Saved adapter weights to "
+                f"{train_args.save_file} and {checkpoint}."
+            )
     fn = ''
     if train_args.prompt_tuning:
         fn += 'prompt_tuning_'
@@ -359,19 +378,24 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
 
     print("Loading pretrained model")
-    model, tokenizer, _ = utils.load(args.model)
+    model, tokenizer = mlx_lm_load_model(args.model)
+    model.value_head = nn.Linear(model.args.hidden_size, 1)
+
+    if args.resume_file is not None:
+        print(f"Loading pretrained weights from {args.resume_file}")
+        model.load_weights(args.resume_file, strict=False)
 
     # Freeze all layers other than PEFT weights
     model.freeze()
-    model.v_head.unfreeze()
+    model.value_head.unfreeze()
     if args.prompt_tuning:
         model = PromptTuning(num_tokens=args.num_prompt_tokens, model=model)
     else:
-        for l in model.model.layers[len(model.model.layers) - args.lora_layers:]:
-            l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
-            l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
-            if hasattr(l, "block_sparse_moe"):
-                l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
+        lora_parameters = {"rank": 16, "alpha": 16, "dropout": 0.1, "scale": 10.0}
+
+        linear_to_lora_layers(
+            model, args.lora_layers, lora_parameters, use_dora=False
+        )
 
     p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
     print(f"Total parameters {p:.3f}M")

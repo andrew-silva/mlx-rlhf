@@ -35,18 +35,6 @@ class ModelArgs(BaseModelArgs):
                 raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def _norm(self, x):
-        return x * mx.rsqrt(x.square().mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x):
-        output = self._norm(x.astype(mx.float32)).astype(x.dtype)
-        return self.weight * output
 
 
 class Attention(nn.Module):
@@ -67,16 +55,16 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 1
-        )
+        # rope_scale = (
+        #     1 / args.rope_scaling["factor"]
+        #     if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
+        #     else 1
+        # )
         self.rope = nn.RoPE(
             head_dim,
             traditional=args.rope_traditional,
             base=args.rope_theta,
-            scale=rope_scale,
+            # scale=rope_scale,
         )
 
     def __call__(
@@ -137,8 +125,8 @@ class TransformerBlock(nn.Module):
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
         self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.args = args
 
     def __call__(
@@ -165,7 +153,7 @@ class LlamaModel(nn.Module):
         self.layers = [
             TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
         ]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
@@ -200,9 +188,21 @@ class LlamaModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        self.args = args
+        self.model_type = "llama"
         self.model = LlamaModel(args)
+        self.n_kv_heads = args.num_attention_heads
+        self.head_dim = args.intermediate_size
+        self.vocab_size = args.vocab_size
+        self.num_hidden_layers = args.num_hidden_layers
+        assert self.vocab_size > 0
+        # self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        # self.layers = [
+        #     TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+        # ]
+        # self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self.v_head = nn.Linear(args.hidden_size, 1, bias=False)
+        self.value_head = nn.Linear(args.hidden_size, 1, bias=False)
         self.is_peft_model = False
 
     def __call__(
@@ -213,4 +213,48 @@ class Model(nn.Module):
         cache=None,
     ):
         out, cache = self.model(input_ids, input_embeds, attention_mask, cache)
-        return self.lm_head(out), cache, self.v_head(out).squeeze(-1)
+        return self.lm_head(out), cache, self.value_head(out).squeeze(-1)
+
+    def generate(self, x, temp=1.0):
+        def sample(logits):
+            if temp == 0:
+                return mx.argmax(logits, axis=-1)
+            else:
+                return mx.random.categorical(logits * (1 / temp))
+
+        cache = []
+
+        # Make an additive causal mask. We will need that to process the prompt.
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
+        mask = mask.astype(self.model.embed_tokens.weight.dtype)
+
+        # First we process the prompt x the same was as in __call__ but
+        # save the caches in cache
+        x = self.model.embed_tokens(x)
+        for l in self.model.layers:
+            x, c = l(x, mask=mask)
+            # We store the per layer cache in a simple python list
+            cache.append(c)
+        x = self.model.norm(x)
+        # We only care about the last logits that generate the next token
+        y = self.lm_head(x[:, -1])
+        y = sample(y)
+
+        yield y
+
+        # Now we parsed the prompt and generated the first token we
+        # need to feed it back into the model and loop to generate the
+        # rest.
+        while True:
+            # Unsqueezing the last dimension to add a sequence length
+            # dimension of 1
+            x = y[:, None]
+            x = self.model.embed_tokens(x)
+            for i in range(len(cache)):
+                # We are overwriting the arrays in the cache list. When
+                # the computation will happen, MLX will be discarding the
+                # old cache the moment it is not needed anymore.
+                x, cache[i] = self.model.layers[i](x, mask=None, cache=cache[i])
+            x = self.model.norm(x)
+            y = sample(self.lm_head(x[:, -1]))
+            yield y

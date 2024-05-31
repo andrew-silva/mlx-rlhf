@@ -26,6 +26,7 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx_lm.utils import generate
 
 from models.base import create_reference_model
 
@@ -87,7 +88,7 @@ class PPOTrainer:
             config: PPOConfig = None,
             model=None,
             ref_model=None,
-            tokenizer: PreTrainedTokenizerBase = None,
+            tokenizer=None,
             optimizer: Optional[optim.Optimizer] = None,
             data_collator: Optional[typing.Callable] = None,
             num_shared_layers: Optional[int] = None,
@@ -119,10 +120,6 @@ class PPOTrainer:
         # Step 0: check positional arguments validity
         if not isinstance(config, PPOConfig):
             raise ValueError(f"config must be a PPOConfig, got {type(config)}")
-        if not isinstance(tokenizer, (PreTrainedTokenizerBase)):
-            raise ValueError(
-                f"tokenizer must be a PreTrainedTokenizerBase like a PreTrainedTokenizer or a PreTrainedTokenizerFast, got {type(tokenizer)}"
-            )
 
         self.model = model
         self.model_params = filter(lambda p: p.requires_grad, self.model.parameters())
@@ -152,10 +149,6 @@ class PPOTrainer:
             else nullcontext
         )
 
-        if not (isinstance(tokenizer, PreTrainedTokenizer) or isinstance(tokenizer, PreTrainedTokenizerFast)):
-            raise ValueError(
-                "tokenizer must be a transformers.PreTrainedTokenizer or transformers.PreTrainedTokenizerFast"
-            )
         self.tokenizer = tokenizer
 
         self._signature_columns = None
@@ -199,6 +192,8 @@ class PPOTrainer:
             batch_size: int = 4,
             return_prompt: bool = True,
             generate_ref_response: bool = False,
+            temperature: float = 0.0,
+            max_tokens: int = 24,
             **generation_kwargs,
     ):
         """
@@ -216,6 +211,8 @@ class PPOTrainer:
                 If set to `False` the prompt is not returned but only the newly generated tokens, defaults to `True`.
             generate_ref_response (`bool`, *optional*):
                 If set to `True` the reference response is also generated, defaults to `False`.
+            temperature: Sampling temperature -- 0.0 for argmax
+            max_new_tokens: New tokens to generate
             generation_kwargs (dict[str, Any]):
                 Keyword arguments for generation.
 
@@ -249,20 +246,20 @@ class PPOTrainer:
                 query_tensor = query_tensor[None, :]
 
             if length_sampler is not None:
-                generation_kwargs["max_new_tokens"] = length_sampler()
-            response = generate_ids(model=self.model,
-                                    input_ids=query_tensor,
-                                    eos_token_id=self.tokenizer.eos_token_id,
-                                    temperature=0.0,
-                                    max_tokens=generation_kwargs['max_new_tokens'])
+                generation_kwargs["max_tokens"] = length_sampler()
+            response = generate_ids(
+                model=self.model,
+                input_ids=query_tensor,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
             if generate_ref_response:
                 with self.optional_peft_ctx():
                     ref_response = generate_ids(
                         model=ref_model,
                         input_ids=query_tensor,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        temperature=0.0,
-                        max_tokens=generation_kwargs['max_new_tokens']
+                        temperature=temperature,
+                        max_tokens=max_tokens
                     )
 
             # if not return_prompt and not self.is_encoder_decoder:
@@ -1055,9 +1052,9 @@ class PPOTrainer:
             )
         elif self.config.log_with == "wandb":
             print(f'Query: {batch_list[0]} | Response: {batch_list[1]} | Reward: {rewards}')
-            table_rows = [list(r) for r in zip(*batch_list, rewards.tolist())]
-            wandb.log({f"game_log_{self.current_step % 25}": wandb.Table(columns=[*columns_to_log, "reward"],
-                                                                         rows=table_rows)})
+            # table_rows = [list(r) for r in zip(*batch_list, [x.item() for x in rewards])]
+            # wandb.log({f"game_log_{self.current_step % 25}": wandb.Table(columns=[*columns_to_log, "reward"],
+            #                                                              rows=table_rows)})
 
         logs.update(stats)
 

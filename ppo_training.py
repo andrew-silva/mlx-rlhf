@@ -19,7 +19,7 @@ Example call to use a pre-trained soft-prompt model from sft.py for RLHF with gr
 python ppo_training.py --log_with=wandb --prompt_tuning --resume_file prompt_weights.npz --num_prompt_tokens 10 --model ../tiny_llama --ground_truth_reward
 
 Example call to use a pre-trained LoRA from sft for RLHF with ground-truth reward:
-python ppo_training.py --log_with=wandb --resume_file lora_weights.npz --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --ground_truth_reward
+python ppo_training.py --log_with=wandb --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --resume_file even_digit_fine_tune.npz --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --ground_truth_reward --num_steps 5550 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 7
 
 Example call to try LoRA without SFT for RLHF with a learned reward model (located at `../reward_model`):
 python ppo_training.py --log_with=wandb --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --reward_model ../reward_model/
@@ -29,9 +29,12 @@ from typing import Optional
 import random
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from tqdm import tqdm
 from transformers import HfArgumentParser
+
+from utils import linear_to_lora_layers
 
 from mlx.utils import tree_flatten
 from mlx_ppo_trainer import PPOTrainer
@@ -41,7 +44,6 @@ import utils
 
 from models.config import PPOConfig
 from models.prompt_tuning import PromptTuning
-from models.lora import LoRALinear
 
 
 def collator(data):
@@ -61,21 +63,30 @@ def main(args_in, ppo_config_in):
     else:
         ref_model = None
 
+    print("Loading pretrained model")
     model, tokenizer, _ = utils.load(args_in.model)
+
+    if args.resume_file is not None:
+        print(f"Loading pretrained weights from {args.resume_file}")
+        model.load_weights(args.resume_file, strict=False)
+
+    # Freeze all layers other than PEFT weights
     model.freeze()
-    model.v_head.unfreeze()
-    if args_in.prompt_tuning:
-        model = PromptTuning(num_tokens=args_in.num_prompt_tokens, model=model)
+    model.value_head.unfreeze()
+    if args.prompt_tuning:
+        model = PromptTuning(num_tokens=args.num_prompt_tokens, model=model)
     else:
-        for l in model.model.layers[len(model.model.layers) - args_in.lora_layers:]:
-            l.self_attn.q_proj = LoRALinear.from_linear(l.self_attn.q_proj)
-            l.self_attn.v_proj = LoRALinear.from_linear(l.self_attn.v_proj)
-            if hasattr(l, "block_sparse_moe"):
-                l.block_sparse_moe.gate = LoRALinear.from_linear(l.block_sparse_moe.gate)
+        lora_parameters = {"rank": 16, "alpha": 16, "dropout": 0.1, "scale": 10.0}
+
+        linear_to_lora_layers(
+            model, args.lora_layers, lora_parameters, use_dora=False
+        )
 
     if args_in.resume_file is not None:
-        print(f"Loading pretrained prompts from {args_in.resume_file}")
+        print(f"Loading pretrained weights from {args_in.resume_file}")
         model.load_weights(args_in.resume_file, strict=False)
+        if ref_model is not None:
+            ref_model.load_weights(args_in.resume_file, strict=False)
 
     p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
     print(f"Total parameters {p:.3f}M")
@@ -86,6 +97,7 @@ def main(args_in, ppo_config_in):
         tokenizer.pad_token_id = tokenizer.eos_token_id
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = 'left'
+        # tokenizer._tokenizer.padding_side = 'left'
 
     # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
     ppo_trainer = PPOTrainer(ppo_config_in, model, ref_model, tokenizer, data_collator=collator)
@@ -106,14 +118,13 @@ def main(args_in, ppo_config_in):
         # "top_p": 1.0,
         # "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id,
-        "max_new_tokens": 24,
+        "max_tokens": 24,
     }
 
     if args_in.me_chatbot:
         train_set = get_all_txts('../../message_data/', tokenizer=tokenizer)
 
-    # TODO: add a command-line arg for num-steps
-    for epoch in range(5500):
+    for epoch in range(args_in.num_steps):
         # TODO: Add a command-line arg for a prompt before each call?
         text_in = []
         for _ in range(ppo_config_in.batch_size):
@@ -138,26 +149,18 @@ def main(args_in, ppo_config_in):
 
         batch["response"] = tokenizer.batch_decode(np.array(response_tensors))
         batch["ref_response"] = tokenizer.batch_decode(np.array(ref_response_tensors))
-        # print(response_tensors.shape)
-        # response_tensors = [response_tensors[0]]
-        # print(response_tensors[0].shape)
-        # ref_response_tensors = [ref_response_tensors[0]]
-
-        # Compute sentiment score
-        # texts = [q + r for q, r in zip(batch["query"], batch["response"])]
-        # ref_texts = [q + r for q, r in zip(batch["query"], batch["ref_response"])]
 
         if args_in.ground_truth_reward:
-            scores = reward_function(batch['response'], negated=False)  # Should we omit query in the scoring?
+            scores = mx.array(reward_function(batch['response'], negated=False))  # Should we omit query in the scoring?
             # scores = [x + np.random.randn() * 0.05 for x in scores]  # Noisify the ground truth reward signal
-            ref_scores = reward_function(batch['ref_response'], negated=True)
+            ref_scores = mx.array(reward_function(batch['ref_response'], negated=False))
         else:
             _, _, scores = reward_function(mx.array(response_tensors))
             _, _, ref_scores = reward_function(mx.array(ref_response_tensors))
-            scores = scores[:, -1].item()
-            ref_scores = [ref_scores[:, -1].item()]
+            scores = scores[:, -1]
+            ref_scores = ref_scores[:, -1]
 
-        rewards = mx.array(scores)
+        rewards = scores
 
         batch["ref_rewards"] = ref_scores
 
