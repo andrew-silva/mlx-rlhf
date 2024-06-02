@@ -38,6 +38,8 @@ The main scripts are `sft.py` and `ppo_training.py`.
 See below for usage on supervised fine-tuning, learning
 a reward model, and using RL to further tune a model.
 
+Throughout this example, I have pushed up two example models for SFT or RLHF -- [increasing digit fine-tune](https://huggingface.co/andrewsilva/increasing_digit_fine_tune) and [increasing even-digit fine-tune](https://huggingface.co/andrewsilva/increasing_even_digit_fine_tune). The digit fine-tunes are useful for using the ground-truth sequence scoring function I've included.
+
 ### Generating Data
 For the running example in this repo, we are using
 synthetic data that generates a series of numerical digits.
@@ -168,42 +170,59 @@ Options for this script include:
 
 ### Generate
 
-For generation use:
+To chat with a trained model, use the `talk_to_model.py` script:
 
 ```
-python lora.py --model <path_to_model> \
-               --adapter-file <path_to_adapters.npz> \
+python talk_to_model.py --model <path_to_model> \
+               --resume-file <path_to_adapters.npz> \
                --max-tokens 50 \
-               --prompt "table: 1-10015132-16
-columns: Player, No., Nationality, Position, Years in Toronto, School/Club Team
-Q: What is terrence ross' nationality
-A: "
+               --temp 0.0
 ```
 
-## Results
+[//]: # (## Results)
+[//]: # ()
+[//]: # (For reference, I'm including my SFT loss for a LoRA on the included digit data,)
 
-For reference, I'm including my SFT loss for a LoRA on the included digit data,
-the reward modeling losses, and plots/generations from the RL script.
-#### SFT Losses:
-| Iteration | Train Loss | Validation Loss |
-| --------- | ---------- | --------------- |
-| 1         |    N/A     |      2.659      |
-| 200       |    1.264   |      1.405      |
-| 400       |    1.201   |      1.303      |
-| 600       |    1.123   |      1.274      |
-| 800       |    1.017   |      1.255      |
-| 1000      |    1.070   |      1.230      |
+[//]: # (the reward modeling losses, and plots/generations from the RL script.)
 
-#### Reward Modeling Losses
-| Iteration | Train Loss | Validation Loss |
-| --------- | ---------- | --------------- |
-| 1         |    N/A     |      2.659      |
-| 200       |    1.264   |      1.405      |
-| 400       |    1.201   |      1.303      |
-| 600       |    1.123   |      1.274      |
-| 800       |    1.017   |      1.255      |
-| 1000      |    1.070   |      1.230      |
-#### RL Plots and Generations:
+[//]: # (#### SFT Losses:)
+
+[//]: # (| Iteration | Train Loss | Validation Loss |)
+
+[//]: # (| --------- | ---------- | --------------- |)
+
+[//]: # (| 1         |    N/A     |      2.659      |)
+
+[//]: # (| 200       |    1.264   |      1.405      |)
+
+[//]: # (| 400       |    1.201   |      1.303      |)
+
+[//]: # (| 600       |    1.123   |      1.274      |)
+
+[//]: # (| 800       |    1.017   |      1.255      |)
+
+[//]: # (| 1000      |    1.070   |      1.230      |)
+
+[//]: # ()
+[//]: # (#### Reward Modeling Losses)
+
+[//]: # (| Iteration | Train Loss | Validation Loss |)
+
+[//]: # (| --------- | ---------- | --------------- |)
+
+[//]: # (| 1         |    N/A     |      2.659      |)
+
+[//]: # (| 200       |    1.264   |      1.405      |)
+
+[//]: # (| 400       |    1.201   |      1.303      |)
+
+[//]: # (| 600       |    1.123   |      1.274      |)
+
+[//]: # (| 800       |    1.017   |      1.255      |)
+
+[//]: # (| 1000      |    1.070   |      1.230      |)
+
+[//]: # (#### RL Plots and Generations:)
 
 
 ## Custom Data

@@ -50,18 +50,9 @@ if __name__ == "__main__":
     while True:
         input_str = input(">>>")
         input_message = f'{output_message}\nUser: {input_str}\nSystem:'
-        input_message = input_str
-        # output_message = generate(
-        #     model=model,
-        #     tokenizer=tokenizer,
-        #     prompt=input_message,
-        #     temp=args.temp,
-        #     max_tokens=args.max_tokens
-        # )
+        # input_message = input_str
         input_message = tokenizer(input_message)
         input_message = mx.array(input_message['input_ids'][-args.max_context:])[None]
-        # output_message = generate_ids(model=model, input_ids=input_message, tokenizer=tokenizer,
-        #                               temp=args.temp, max_tokens=args.max_tokens)
         output_message = []
         for token in model.generate(input_message, args.temp):
             output_message.append(token.item())

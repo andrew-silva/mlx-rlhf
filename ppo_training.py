@@ -165,9 +165,11 @@ def main(args_in, ppo_config_in):
         batch["ref_rewards"] = ref_scores
 
         # Run PPO step
-        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
-        ppo_trainer.log_stats(stats, batch, rewards,
-                              columns_to_log=["query", "response", "ref_response", "ref_rewards"])
+        if len(rewards.shape) > 0 and rewards.shape[0] > 1:
+            ppo_trainer.config.batch_size = rewards.shape[0]
+            stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+            ppo_trainer.log_stats(stats, batch, rewards,
+                                  columns_to_log=["query", "response", "ref_response", "ref_rewards"])
     # Save prompt weights
     mx.savez(args_in.save_file, **dict(tree_flatten(model.trainable_parameters())))
 
