@@ -64,9 +64,8 @@ def load_datasets(train_args, tokenizer=None):
         all_data = get_all_txts(
             train_args.data,
             tokenizer,
-            chunk_length=128,
-            prior_context_length=16,
-            reverse_query=train_args.reward_model
+            chunk_length=256,
+            prior_context_length=32,
         )
         shuffle(all_data)
         valid_split_size = 1000
