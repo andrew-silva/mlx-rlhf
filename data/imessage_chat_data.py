@@ -70,7 +70,7 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
     """
     chunks = []
     current_chunk = {'input_ids': [], 'labels': []}
-    sys_prompt = 'System: '
+    sys_prompt = 'Andrew: '
     masked_out_tokens = np.array(tokenizer(sys_prompt)['input_ids'])
     for sender, me in chat_messages:
         sender_message = f'\nUser: {sender}\n{sys_prompt}'

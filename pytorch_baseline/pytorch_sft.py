@@ -328,13 +328,10 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
 
             start = time.perf_counter()
 
-        # if (it+1) % train_args.save_every == 0:
-        #     os.makedirs(args.save_file, exist_ok=True)
-        #     torch.save({'value_head': mdl.value_head.state_dict()}, train_args.save_file + '/value_head.pt')
-        #     save_model = mdl.merge_and_unload()
-        #     save_model.save_pretrained(args.save_file)
-        #     save_model = None
-        #     del save_model
+        if (it+1) % train_args.save_every == 0:
+            os.makedirs(args.save_file, exist_ok=True)
+            torch.save({'value_head': mdl.value_head.state_dict()}, train_args.save_file + '/value_head.pt')
+            mdl.save_pretrained(args.save_file)
 
     fn = ''
     if train_args.prompt_tuning:
