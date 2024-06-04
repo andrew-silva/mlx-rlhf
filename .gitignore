@@ -167,3 +167,9 @@ sft_fine_tune/
 
 *.png
 
+*.pt
+
+*.safetensors
+
+*.json
+
