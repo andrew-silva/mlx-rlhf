@@ -150,6 +150,16 @@ Options for this script include:
 * `--resume_file` -- File to load in the pre-trained adapter or prompts from.
 * `--use_peft` -- NOT SUPPORTED -- To-do is to actually support this, but ignore it for now.
 
+**To reproduce my results with MLX:**
+```bash
+python ppo_training.py --log_with=wandb --model andrewsilva/increasing_even_digit_fine_tune --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --ground_truth_reward --num_steps 500 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 7
+```
+**To reproduce my results with PyTorch:**
+```bash
+python pytorch_ppo_training.py --model andrewsilva/increasing_even_digit_fine_tune --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --log_with wandb --ground_truth_reward --tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0 --num_steps 5550 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 7
+```
+
+
 ### Generate
 
 To chat with a trained model, use the `talk_to_model.py` script:
@@ -160,6 +170,15 @@ python talk_to_model.py --model <path_to_model> \
                --max-tokens 50 \
                --temp 0.0
 ```
+
+## Results
+
+### MLX results:
+![Reward plot for RLHF with MLX](mlx_reward.png)
+
+### PyTorch Results
+![Reward plot for RLHF with PyTorch](pytorch_reward.png)
+
 
 ## Custom Data
 

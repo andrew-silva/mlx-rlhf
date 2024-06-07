@@ -51,7 +51,6 @@ This is the launcher script for running RLHF/RLAIF with MLX, using the `mlx_ppo_
 This loads in a pretrained model with MLX-LM and runs it in the terminal for you to live-chat with the model. Good for testing out how well things are working.
 
 
-
 ## To-Do
 
 There are a few areas left open for me (or you!) to patch in:
