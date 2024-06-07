@@ -177,4 +177,4 @@ def get_all_txts(message_dir, tokenizer, chunk_length=512, prior_context_length=
 
 # if __name__ == "__main__":
     # Wherever you run `imessage-exporter -f txt -o message_data`
-    # dataset = get_all_txts('/Users/andrewsilva/Projects/research/code/tinkerings/message_data/')
+    # dataset = get_all_txts('/Users/andrewsilva/message_data/')

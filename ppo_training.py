@@ -122,6 +122,7 @@ def main(args_in, ppo_config_in):
     }
 
     if args_in.me_chatbot:
+        # TODO: Add a command-line arg to point to the directory for message_data
         train_set = get_all_txts('../../message_data/', tokenizer=tokenizer)
 
     for epoch in range(args_in.num_steps):

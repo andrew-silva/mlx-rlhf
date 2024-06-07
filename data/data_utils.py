@@ -61,6 +61,7 @@ def load_datasets(train_args, tokenizer=None):
     train_data, valid, test = [], [], []
     if 'chat' in ds_base:
         # To do me-chatbot, use 'chat' as data-base and '/path/to/your/message_data' as data
+        # TODO: Add command line args for the chunk-length and prior-context-length
         all_data = get_all_txts(
             train_args.data,
             tokenizer,
