@@ -4,7 +4,7 @@
 import os
 import argparse
 import time
-from data.data_utils import load_datasets, mask_between_sos
+from data.data_utils import load_datasets, build_parser
 
 import matplotlib.pyplot as plt
 
@@ -30,135 +30,6 @@ Learning a fine-tuned me-chatbot
 python pytorch_sft.py --data ../../message_data/ --save-file sft_fine_tune/ --data-base chat --model meta-llama/Llama-2-7b-chat-hf --train --iters 15000 --batch-size 4 --steps-per-eval 1000
 
 """
-
-
-def build_parser():
-    arg_parse = argparse.ArgumentParser(description="Soft Prompt finetuning.")
-    arg_parse.add_argument(
-        "--model",
-        default="model",
-        help="The path to the local model directory or Hugging Face repo.",
-    )
-    arg_parse.add_argument(
-        "--tokenizer",
-        default=None,
-        help="The path to the tokenizer we want to use. If none, use args.model.",
-    )
-    # Generation args
-    arg_parse.add_argument(
-        "--max-tokens",
-        "-m",
-        type=int,
-        default=100,
-        help="The maximum number of tokens to generate",
-    )
-    arg_parse.add_argument(
-        "--temp", type=float, default=0.8, help="The sampling temperature"
-    )
-    arg_parse.add_argument(
-        "--prompt",
-        "-p",
-        type=str,
-        help="The prompt for generation",
-        default=None,
-    )
-
-    # Training args
-    arg_parse.add_argument(
-        "--train",
-        action="store_true",
-        help="Do training",
-    )
-    arg_parse.add_argument(
-        "--reward-model",
-        action="store_true",
-        help="Train a reward model instead of a SFT model"
-    )
-    arg_parse.add_argument(
-        "--prompt-tuning",
-        action="store_true",
-        help="Should we train with prompt tuning? If not, use LoRA",
-    )
-    arg_parse.add_argument(
-        "--data",
-        type=str,
-        default="data/",
-        help="Directory with {train, valid, test}.jsonl files",
-    )
-    arg_parse.add_argument(
-        "--data-base",
-        type=str,
-        default="",
-        help="Base name for the .jsonl files. E.g., 'increasing_mult_2_'",
-    )
-    arg_parse.add_argument(
-        "--num-prompt-tokens",
-        type=int,
-        default=10,
-        help="Number of prompt tokens to pre-pend",
-    )
-    arg_parse.add_argument(
-        "--lora-layers",
-        type=int,
-        default=16,
-        help="Number of layers to fine-tune",
-    )
-    arg_parse.add_argument("--batch-size", type=int, default=4, help="Minibatch size.")
-    arg_parse.add_argument(
-        "--iters", type=int, default=1000, help="Iterations to train for."
-    )
-    arg_parse.add_argument(
-        "--val-batches",
-        type=int,
-        default=25,
-        help="Number of validation batches, -1 uses the entire validation set.",
-    )
-    arg_parse.add_argument(
-        "--learning-rate", type=float, default=1e-6, help="Adam learning rate."
-    )
-    arg_parse.add_argument(
-        "--steps-per-report",
-        type=int,
-        default=10,
-        help="Number of training steps between loss reporting.",
-    )
-    arg_parse.add_argument(
-        "--steps-per-eval",
-        type=int,
-        default=200,
-        help="Number of training steps between validations.",
-    )
-    arg_parse.add_argument(
-        "--resume-file",
-        type=str,
-        default=None,
-        help="Load path to resume training with the given PEFT weights.",
-    )
-    arg_parse.add_argument(
-        "--save-file",
-        type=str,
-        default="peft_weights.npz",
-        help="Save/load path for the trained PEFT weights.",
-    )
-    arg_parse.add_argument(
-        "--save-every",
-        type=int,
-        default=100,
-        help="Save the model every N iterations.",
-    )
-    arg_parse.add_argument(
-        "--test",
-        action="store_true",
-        help="Evaluate on the test set after training",
-    )
-    arg_parse.add_argument(
-        "--test-batches",
-        type=int,
-        default=500,
-        help="Number of test set batches, -1 uses the entire test set.",
-    )
-    arg_parse.add_argument("--seed", type=int, default=0, help="The PRNG seed")
-    return arg_parse
 
 
 def reward_loss(mdl, better_inputs, worse_inputs):
@@ -376,7 +247,8 @@ if __name__ == "__main__":
     # Resume training the given weights.
     if args.resume_file is not None:
         print(f"Loading pretrained weights from {args.resume_file}")
-        model.load_weights(args.resume_file, strict=False)
+        model.load_adapter(args.resume_file, 'sft_fine_tune')
+        model.set_adapter('sft_fine_tune')
 
     if args.train:
         print("Training")

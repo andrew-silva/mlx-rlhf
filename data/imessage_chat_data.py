@@ -71,13 +71,13 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
     chunks = []
     current_chunk = {'input_ids': [], 'labels': []}
     sys_prompt = 'Andrew: '
-    masked_out_tokens = np.array(tokenizer(sys_prompt)['input_ids'])
     for sender, me in chat_messages:
+        # TODO: Replace "User" with friend tokens
         sender_message = f'\nUser: {sender}\n{sys_prompt}'
         me_message = f'{me}'
         # TODO: If this is a reward function... generate the alternate responses via LLM? idk...
         sender_tokens = tokenizer(sender_message)['input_ids']
-        me_tokens = tokenizer(me_message)['input_ids']
+        me_tokens = tokenizer(me_message, add_special_tokens=False)['input_ids']
 
         # Add prior context tokens if a previous chunk exists and if we have nothing yet in this chunk
         if len(chunks) > 0 and len(current_chunk['input_ids']) == 0:
@@ -137,24 +137,6 @@ def densify_chat(chat_messages, tokenizer, chunk_length: int = 512, prior_contex
     return chunks
 
 
-def find_index_of_second_targets(labels, target_label: int = -100):
-    """
-    Given a set of targets like [-100, -100, 2, 3, 1, -100, -100], find the first -100 after a set of positive numbers
-    Args:
-        labels: list of targets
-        target_label: int to search for
-    Returns:
-        index of the target integer's first appearance after non-target numbers or -1 if there was no second target
-    """
-    last_positive_index = -1
-    for i, label in enumerate(labels):
-        if label != target_label:
-            last_positive_index = i
-        elif last_positive_index != -1:
-            return i
-    return -1
-
-
 def get_all_txts(message_dir, tokenizer, chunk_length=512, prior_context_length=32, reward_function: bool = False):
     dataset = []
     for fn in glob.glob(f'{message_dir}/*.txt'):
@@ -175,6 +157,15 @@ def get_all_txts(message_dir, tokenizer, chunk_length=512, prior_context_length=
     return dataset
 
 
-# if __name__ == "__main__":
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    tokenizer_demo = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-chat-hf')
     # Wherever you run `imessage-exporter -f txt -o message_data`
-    # dataset = get_all_txts('/Users/andrewsilva/message_data/')
+    dataset = get_all_txts('../../message_data/',
+                           tokenizer_demo,
+                           chunk_length=256,
+                           prior_context_length=24)
+    for i in range(5):
+        print(f'dataset sample {i}: {dataset[i]} \n reads as: {tokenizer_demo.decode(dataset[i]["input_ids"])}')
+    print(f'{len(dataset)} total samples -- estimated to have {len(dataset)*256} tokens')
+

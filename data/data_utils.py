@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 from data.imessage_chat_data import get_all_txts
 from random import shuffle
-import numpy as np
+import argparse
 
 
 class TuningDataset:
@@ -81,28 +81,130 @@ def load_datasets(train_args, tokenizer=None):
     return train_data, valid, test
 
 
-def mask_between_sos(arr_in, sos_token=1, mask_value=-100):
-    """
-    Set all values between the first and last occurrence of SOS to mask_value in each row of the array.
+def build_parser():
+    arg_parse = argparse.ArgumentParser(description="Argument parser for supervised finetuning.")
+    arg_parse.add_argument(
+        "--model",
+        default="mlx_model",
+        help="The path to the local model directory or Hugging Face repo.",
+    )
+    arg_parse.add_argument(
+        "--tokenizer",
+        default=None,
+        help="The path to the tokenizer we want to use. If none, use args.model.",
+    )
+    # Generation args
+    arg_parse.add_argument(
+        "--max-tokens",
+        "-m",
+        type=int,
+        default=100,
+        help="The maximum number of tokens to generate",
+    )
+    arg_parse.add_argument(
+        "--temp", type=float, default=0.8, help="The sampling temperature"
+    )
+    arg_parse.add_argument(
+        "--prompt",
+        "-p",
+        type=str,
+        help="The prompt for generation",
+        default=None,
+    )
 
-    Parameters:
-        arr_in: Input 2D numpy array
-        sos_token: Value of the SOS token to search for
-        mask_value: Value to overwrite arrays with
-
-    Returns:
-        Modified array with values set to mask_value between the first and last occurrence of SOS in each row
-    """
-    arr_in = np.array(arr_in)
-    # Find the indices of the first and last occurrences of SOS in each row
-    first_ones_indices = np.argmax(arr_in == sos_token, axis=1)
-    last_ones_indices = arr_in.shape[1] - np.argmax(np.flip(arr_in == sos_token, axis=1), axis=1) - 1
-
-    # Create a mask to set values between the first and last occurrences of SOS to mask_value
-    mask = (np.arange(arr_in.shape[1])[:, None] >= first_ones_indices) & \
-           (np.arange(arr_in.shape[1])[:, None] < last_ones_indices)
-
-    # Apply the mask to set values to -100
-    arr_in[mask.transpose()] = mask_value
-
-    return arr_in
+    # Training args
+    arg_parse.add_argument(
+        "--train",
+        action="store_true",
+        help="Do training",
+    )
+    arg_parse.add_argument(
+        "--reward-model",
+        action="store_true",
+        help="Train a reward model instead of a SFT model"
+    )
+    arg_parse.add_argument(
+        "--prompt-tuning",
+        action="store_true",
+        help="Should we train with prompt tuning? If not, use LoRA",
+    )
+    arg_parse.add_argument(
+        "--data",
+        type=str,
+        default="data/",
+        help="Directory with {train, valid, test}.jsonl files",
+    )
+    arg_parse.add_argument(
+        "--data-base",
+        type=str,
+        default="",
+        help="Base name for the .jsonl files. E.g., 'increasing_mult_2_'",
+    )
+    arg_parse.add_argument(
+        "--num-prompt-tokens",
+        type=int,
+        default=10,
+        help="Number of prompt tokens to pre-pend",
+    )
+    arg_parse.add_argument(
+        "--lora-layers",
+        type=int,
+        default=16,
+        help="Number of layers to fine-tune",
+    )
+    arg_parse.add_argument("--batch-size", type=int, default=4, help="Minibatch size.")
+    arg_parse.add_argument(
+        "--iters", type=int, default=1000, help="Iterations to train for."
+    )
+    arg_parse.add_argument(
+        "--val-batches",
+        type=int,
+        default=25,
+        help="Number of validation batches, -1 uses the entire validation set.",
+    )
+    arg_parse.add_argument(
+        "--learning-rate", type=float, default=1e-6, help="Adam learning rate."
+    )
+    arg_parse.add_argument(
+        "--steps-per-report",
+        type=int,
+        default=10,
+        help="Number of training steps between loss reporting.",
+    )
+    arg_parse.add_argument(
+        "--steps-per-eval",
+        type=int,
+        default=200,
+        help="Number of training steps between validations.",
+    )
+    arg_parse.add_argument(
+        "--resume-file",
+        type=str,
+        default=None,
+        help="Load path to resume training with the given PEFT weights.",
+    )
+    arg_parse.add_argument(
+        "--save-file",
+        type=str,
+        default="peft_weights.npz",
+        help="Save/load path for the trained PEFT weights.",
+    )
+    arg_parse.add_argument(
+        "--save-every",
+        type=int,
+        default=100,
+        help="Save the model every N iterations.",
+    )
+    arg_parse.add_argument(
+        "--test",
+        action="store_true",
+        help="Evaluate on the test set after training",
+    )
+    arg_parse.add_argument(
+        "--test-batches",
+        type=int,
+        default=500,
+        help="Number of test set batches, -1 uses the entire test set.",
+    )
+    arg_parse.add_argument("--seed", type=int, default=0, help="The PRNG seed")
+    return arg_parse
