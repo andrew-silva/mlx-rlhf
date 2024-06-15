@@ -56,7 +56,7 @@ This loads in a pretrained model with MLX-LM and runs it in the terminal for you
 There are a few areas left open for me (or you!) to patch in:
 
 - [ ] Improve the efficiency of the reward-loss computation (it could be batched)
-- [ ] Add/switch to QLoRA for more memory efficiency and faster learning
+- [x] Add/switch to QLoRA for more memory efficiency and faster learning
 - [ ] Generally improve the integration with `mlx-lm` for more base models and PEFT methods.
 - [ ] Address #TODOs in the code (add command line args/config parameters for various hard-coded variables)
 - [ ] Fix the way we're logging text to W&B (currently generating thousands of artifacts)
