@@ -1,8 +1,6 @@
 # Modified by Andrew Silva from https://github.com/ml-explore/mlx-examples/blob/main/lora/lora.py
 #
 # Copyright © 2023 Apple Inc.
-
-import argparse
 import math
 import time
 from typing import Union
@@ -14,11 +12,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-import utils
 from mlx.utils import tree_flatten
-from mlx_lm.tuner.utils import linear_to_lora_layers
-from mlx_lm.utils import load as mlx_lm_load_model
-from models.prompt_tuning import PromptTuning
+from utils import get_model_and_tokenizer
+
 
 """
 Example command for supervised fine-tuning with soft-prompts on generated data with a locally saved tiny llama:
@@ -46,7 +42,6 @@ def loss(mdl, inputs, targets, lengths):
     """
     # Run model on inputs
     logits = mdl(inputs)
-    logits = logits.astype(mx.float32)
 
     # Mask padding tokens
     length_mask = mx.arange(inputs.shape[1])[None, :] < lengths[:, None]
@@ -253,30 +248,7 @@ if __name__ == "__main__":
 
     np.random.seed(args.seed)
 
-    print("Loading pretrained model")
-    model, tokenizer = mlx_lm_load_model(args.model)
-    model.value_head = nn.Linear(model.args.hidden_size, 1)
-
-    if args.resume_file is not None:
-        print(f"Loading pretrained weights from {args.resume_file}")
-        model.load_weights(args.resume_file, strict=False)
-
-    # Freeze all layers other than PEFT weights
-    model.freeze()
-    model.value_head.unfreeze()
-    if args.prompt_tuning:
-        model = PromptTuning(num_tokens=args.num_prompt_tokens, model=model)
-    else:
-        lora_parameters = {"rank": 16, "alpha": 16, "dropout": 0.1, "scale": 10.0}
-
-        linear_to_lora_layers(
-            model, args.lora_layers, lora_parameters, use_dora=False
-        )
-
-    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
-    print(f"Total parameters {p:.3f}M")
-    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10 ** 6
-    print(f"Trainable parameters {p:.3f}M")
+    model, tokenizer = get_model_and_tokenizer(args)
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_datasets(args, tokenizer)
@@ -317,7 +289,3 @@ if __name__ == "__main__":
         test_ppl = math.exp(test_loss)
 
         print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
-
-    if args.prompt is not None:
-        print("Generating")
-        utils.generate(model, args.prompt, tokenizer, args)

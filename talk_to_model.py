@@ -2,9 +2,7 @@
 Created by Andrew Silva on 5/11/2024
 """
 import mlx.core as mx
-from mlx_lm.utils import load as mlx_lm_load_model
-from mlx_lm.utils import generate
-from utils import generate_ids, load
+from utils import get_model_and_tokenizer, load
 import argparse
 
 if __name__ == "__main__":
@@ -18,6 +16,11 @@ if __name__ == "__main__":
         "--resume-file",
         default="digit_fine_tune.npz",
         help="Adapter file location"
+    )
+    arg_parse.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Should the model be quantized?"
     )
     # Generation args
     arg_parse.add_argument(
@@ -38,12 +41,7 @@ if __name__ == "__main__":
         "--temp", type=float, default=0.0, help="The sampling temperature"
     )
     args = arg_parse.parse_args()
-    model, tokenizer, _ = load(args.model)
-    #
-    # if args.resume_file is not None:
-    #     print(f"Loading pretrained weights from {args.resume_file}")
-    #     model.load_weights(args.resume_file, strict=False)
-    #
+    model, tokenizer = get_model_and_tokenizer(args, need_generate=True, add_peft=False)
 
     print("Type your message to the chat bot below:")
     output_message = ''

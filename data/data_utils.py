@@ -89,6 +89,11 @@ def build_parser():
         help="The path to the local model directory or Hugging Face repo.",
     )
     arg_parse.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Should the model be quantized when using MLX?",
+    )
+    arg_parse.add_argument(
         "--tokenizer",
         default=None,
         help="The path to the tokenizer we want to use. If none, use args.model.",

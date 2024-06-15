@@ -9,12 +9,18 @@ import random
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_unflatten
-import models.llama as llama
-import models.mixtral as mixtral
+from mlx.utils import tree_unflatten, tree_flatten
+
 from mlx_lm.tuner.dora import DoRALinear
 from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_lm.tuner.utils import linear_to_lora_layers as mlx_lm_linear_to_lora
+from mlx_lm.utils import load as mlx_lm_load_model
+from mlx_lm.utils import quantize_model
+
+from models.prompt_tuning import PromptTuning
+import models.llama as llama
+import models.mixtral as mixtral
 
 import numpy as np
 import transformers
@@ -491,72 +497,6 @@ def load(path_or_hf_repo: str):
     return model, tokenizer, config
 
 
-def _generate_token(
-        prompt: mx.array, model: nn.Module, temp: float = 0.0
-) -> Generator[mx.array, None, None]:
-    """
-    Generate text based on the given prompt and model.
-
-    Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The model to use for generation.
-        temp (float): The temperature for sampling. If temp is 0, use max sampling.
-
-    Yields:
-        mx.array: The generated text.
-    """
-
-    def sample(sampled_logits: mx.array) -> mx.array:
-        return (
-            mx.argmax(sampled_logits, axis=-1)
-            if temp == 0
-            else mx.random.categorical(sampled_logits * (1 / temp))
-        )
-
-    y = prompt
-
-    cache = None
-    while True:
-        if len(y.shape) < 2:
-            y = y[None]
-        logits, _, _ = model(y, cache=cache)
-        if logits.shape[1] < 1:
-            logits = logits[:, None, :]
-        logits = logits[:, -1, :]
-        if len(logits.shape) > 2:
-            print(logits.shape)
-            # logits = logits.squeeze()
-            # print(logits.shape)
-        y = sample(logits)
-        yield y
-
-#
-# def generate(model, prompt, tokenizer, args):
-#     print(prompt, end="", flush=True)
-#
-#     prompt = mx.array(tokenizer.encode(prompt))
-#
-#     tokens = []
-#     skip = 0
-#     for token, n in zip(
-#             _generate_token(prompt, model, args.temp),
-#             range(args.max_tokens),
-#     ):
-#         if token == tokenizer.eos_token_id:
-#             break
-#
-#         tokens.append([x.item() for x in token])
-#         s = tokenizer.decode(tokens)
-#         if len(s) - skip > 1:
-#             print(s[skip:-1], end="", flush=True)
-#             skip = len(s) - 1
-#     print(tokenizer.decode(tokens)[skip:], flush=True)
-#     print("=" * 10)
-#     if len(tokens) == 0:
-#         print("No tokens generated for this prompt")
-#         return
-#
-#
 def generate_ids(model, input_ids, eos_token_id=100_000, temperature=0.0, max_tokens=128):
     prompt = mx.array(input_ids)
     max_tokens -= prompt.shape[-1]  # consider prompt as part of total # of tokens
@@ -571,150 +511,6 @@ def generate_ids(model, input_ids, eos_token_id=100_000, temperature=0.0, max_to
             token = token[:, None]
         tokens.append(token)
     return mx.concatenate(tokens, axis=1)  # .transpose()
-#
-#
-# def generate_step(
-#     prompt: mx.array,
-#     model: nn.Module,
-#     temp: float = 0.0,
-#     repetition_penalty=None,
-#     repetition_context_size=20,
-#     top_p: float = 1.0,
-#     logit_bias=None):
-#     """
-#     A generator producing text based on the given prompt from the model.
-#
-#     Args:
-#         prompt (mx.array): The input prompt.
-#         model (nn.Module): The model to use for generation.
-#         temp (float): The temperature for sampling, if 0 the argmax is used.
-#         repetition_penalty (float, optional): The penalty factor for repeating tokens.
-#         repetition_context_size (int, optional): The number of tokens to consider for repetition penalty (default 20).
-#         top_p (float, optional): Nulceus sampling, higher means model considers more less likely words
-#
-#     Yields:
-#         Generator[Tuple[mx.array, mx.array]]: A generator producing
-#         one token and probability per call.
-#     """
-#
-#     def sample(logits: mx.array) -> Tuple[mx.array, float]:
-#         if logit_bias:
-#             indices = mx.array(list(logit_bias.keys()))
-#             values = mx.array(list(logit_bias.values()))
-#             logits[:, indices] += values
-#         softmax_logits = mx.softmax(logits)
-#
-#         if temp == 0:
-#             token = mx.argmax(logits, axis=-1)
-#         else:
-#             if top_p > 0 and top_p < 1.0:
-#                 token = top_p_sampling(logits, top_p, temp)
-#             else:
-#                 token = mx.random.categorical(logits * (1 / temp))
-#
-#         prob = softmax_logits[0, token]
-#         return token, prob
-#
-#     if repetition_penalty and (
-#         repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-#     ):
-#         raise ValueError(
-#             f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
-#         )
-#
-#     y = prompt
-#     kv_heads = (
-#         [model.n_kv_heads] * len(model.layers)
-#         if isinstance(model.n_kv_heads, int)
-#         else model.n_kv_heads
-#     )
-#     if len(prompt.shape) < 2:
-#         cache = [KVCache(model.head_dim, n) for n in kv_heads]
-#     else:
-#         cache = [[KVCache(model.head_dim, n) for n in kv_heads] for _ in range(prompt.shape[0])]
-#
-#     repetition_context = prompt.tolist()
-#
-#     if repetition_context_size:
-#         repetition_context = repetition_context[-repetition_context_size:]
-#
-#     def _step(y):
-#         nonlocal repetition_context
-#         if len(y.shape) < 2:
-#             y = y[None]
-#         logits = model(y, cache=cache)
-#         logits = logits[:, -1, :]
-#
-#         if repetition_penalty:
-#             logits = apply_repetition_penalty(
-#                 logits, repetition_context, repetition_penalty
-#             )
-#             y, prob = sample(logits)
-#             repetition_context.append(y.item())
-#         else:
-#             y, prob = sample(logits)
-#
-#         if repetition_context_size:
-#             if len(repetition_context) > repetition_context_size:
-#                 repetition_context = repetition_context[-repetition_context_size:]
-#         return y, prob
-#
-#     y, p = _step(y)
-#
-#     mx.async_eval(y)
-#     while True:
-#         next_y, next_p = _step(y)
-#         mx.async_eval(next_y)
-#         yield y.item(), p
-#         y, p = next_y, next_p
-#
-#
-# def generate_ids(
-#     model: nn.Module,
-#     tokenizer,
-#     input_ids,
-#     temp: float = 0.0,
-#     max_tokens: int = 100,
-#     repetition_penalty=None,
-#     repetition_context_size=None,
-#     top_p: float = 1.0,
-#     logit_bias=None):
-#     """
-#     Generate text from the model.
-#
-#     Args:
-#        model (nn.Module): The language model.
-#        tokenizer (PreTrainedTokenizer): The tokenizer.
-#        input_ids: The encoded prompt
-#        temp (float): The temperature for sampling (default 0).
-#        max_tokens (int): The maximum number of tokens (default 100).
-#        repetition_penalty (float, optional): The penalty factor for repeating tokens.
-#        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
-#        top_p
-#        logit_bias
-#     """
-#     if len(input_ids.shape) < 2:
-#         input_ids = input_ids[None]
-#     all_gens = []
-#     for seq in input_ids:
-#         output_gen = []
-#         for (token, prob), n in zip(
-#             generate_step(
-#                 seq,
-#                 model,
-#                 temp,
-#                 repetition_penalty,
-#                 repetition_context_size,
-#                 top_p,
-#                 logit_bias,
-#             ),
-#             range(max_tokens),
-#         ):
-#             if token == tokenizer.eos_token_id:
-#                 break
-#             output_gen.append(token)
-#         all_gens.append(output_gen)
-#     return mx.array(all_gens)
 
 
 def linear_to_lora_layers(
@@ -762,7 +558,6 @@ def linear_to_lora_layers(
         return LoRALayer.from_linear(
             layer,
             r=config["rank"],
-            alpha=config["alpha"],
             scale=config["scale"],
             dropout=config["dropout"],
         )
@@ -808,3 +603,52 @@ def linear_to_lora_layers(
     for l in model.model.layers[num_layers - num_lora_layers :]:
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
         l.update_modules(tree_unflatten(lora_layers))
+
+
+def get_model_and_tokenizer(args_in, need_generate: bool = False, add_peft: bool = True):
+    if need_generate:
+        model, tokenizer, _ = load(args_in.model)
+    else:
+        model, tokenizer = mlx_lm_load_model(args_in.model)
+        tokenizer = tokenizer._tokenizer  # Unwrap tokenizer to get base object
+
+    if not hasattr(model, 'value_head'):
+        model.value_head = nn.Linear(model.args.hidden_size, 1)
+
+    if args_in.quantize:
+        q_group_size = 64
+        q_bits = 4
+        weights, _ = quantize_model(model, {}, q_group_size, q_bits)
+
+    if args_in.resume_file is not None:
+        print(f"Loading pretrained weights from {args_in.resume_file}")
+        model.load_weights(args_in.resume_file, strict=False)
+
+    # Freeze all layers other than PEFT weights
+    if add_peft:
+        model.freeze()
+        model.value_head.unfreeze()
+        if args_in.prompt_tuning:
+            model = PromptTuning(num_tokens=args_in.num_prompt_tokens, model=model)
+        else:
+            lora_parameters = {"rank": 16, "dropout": 0.1, "scale": 10.0}
+            if need_generate:
+                linear_to_lora_layers(
+                    model, args_in.lora_layers, lora_parameters, use_dora=False
+                )
+            else:
+                mlx_lm_linear_to_lora(
+                    model, args_in.lora_layers, lora_parameters, use_dora=False
+                )
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+
+    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
+    print(f"Total parameters {p:.3f}M")
+    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10 ** 6
+    print(f"Trainable parameters {p:.3f}M")
+
+    return model, tokenizer
