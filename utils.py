@@ -605,7 +605,7 @@ def linear_to_lora_layers(
         l.update_modules(tree_unflatten(lora_layers))
 
 
-def get_model_and_tokenizer(args_in, need_generate: bool = False):
+def get_model_and_tokenizer(args_in, need_generate: bool = False, add_peft: bool = True):
     if need_generate:
         model, tokenizer, _ = load(args_in.model)
     else:
@@ -625,20 +625,21 @@ def get_model_and_tokenizer(args_in, need_generate: bool = False):
         model.load_weights(args_in.resume_file, strict=False)
 
     # Freeze all layers other than PEFT weights
-    model.freeze()
-    model.value_head.unfreeze()
-    if args_in.prompt_tuning:
-        model = PromptTuning(num_tokens=args_in.num_prompt_tokens, model=model)
-    else:
-        lora_parameters = {"rank": 16, "dropout": 0.1, "scale": 10.0}
-        if need_generate:
-            linear_to_lora_layers(
-                model, args_in.lora_layers, lora_parameters, use_dora=False
-            )
+    if add_peft:
+        model.freeze()
+        model.value_head.unfreeze()
+        if args_in.prompt_tuning:
+            model = PromptTuning(num_tokens=args_in.num_prompt_tokens, model=model)
         else:
-            mlx_lm_linear_to_lora(
-                model, args_in.lora_layers, lora_parameters, use_dora=False
-            )
+            lora_parameters = {"rank": 16, "dropout": 0.1, "scale": 10.0}
+            if need_generate:
+                linear_to_lora_layers(
+                    model, args_in.lora_layers, lora_parameters, use_dora=False
+                )
+            else:
+                mlx_lm_linear_to_lora(
+                    model, args_in.lora_layers, lora_parameters, use_dora=False
+                )
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
