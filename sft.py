@@ -1,8 +1,6 @@
 # Modified by Andrew Silva from https://github.com/ml-explore/mlx-examples/blob/main/lora/lora.py
 #
 # Copyright © 2023 Apple Inc.
-
-import argparse
 import math
 import time
 from typing import Union
@@ -15,11 +13,8 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_flatten
-# from mlx_lm.tuner.utils import linear_to_lora_layers
-# from mlx_lm.utils import load as mlx_lm_load_model
-# from mlx_lm.utils import quantize_model
 from utils import get_model_and_tokenizer
-from models.prompt_tuning import PromptTuning
+
 
 """
 Example command for supervised fine-tuning with soft-prompts on generated data with a locally saved tiny llama:
