@@ -128,10 +128,11 @@ def evaluate(mdl, dataset, tok, train_args, device='mps'):
     ):
         input_ids = batch[0].to(device)
         targets = batch[1].to(dtype=torch.long, device=device)
-        if train_args.reward_model:
-            loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
-        else:
-            loss = mdl(input_ids=input_ids, labels=targets).loss
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            if train_args.reward_model:
+                loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
+            else:
+                loss = mdl(input_ids=input_ids, labels=targets).loss
         all_losses.append(loss.item())
 
     return np.sum(all_losses) / max(ntokens, train_args.val_batches)
@@ -143,7 +144,7 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
     val_losses = []
     n_tokens = 0
     mdl.to(device)
-
+    torch.set_float32_matmul_precision('high')
     # Main training loop
     start = time.perf_counter()
     for it, batch in zip(
@@ -157,10 +158,11 @@ def train(mdl, train_ds, val_set, optimizer, tok, train_args, device='mps'):
         targets = batch[1].to(dtype=torch.long, device=device)
 
         # Use reward learning if applicable, else just use HF LM loss
-        if train_args.reward_model:
-            loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
-        else:
-            loss = mdl(input_ids=input_ids, labels=targets).loss
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            if train_args.reward_model:
+                loss = reward_loss(mdl=mdl, better_inputs=input_ids, worse_inputs=targets)
+            else:
+                loss = mdl(input_ids=input_ids, labels=targets).loss
         if not torch.isnan(loss):
             loss.backward()
             optimizer.step()
