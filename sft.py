@@ -18,6 +18,7 @@ import utils
 from mlx.utils import tree_flatten
 from mlx_lm.tuner.utils import linear_to_lora_layers
 from mlx_lm.utils import load as mlx_lm_load_model
+from mlx_lm.utils import quantize_model
 from models.prompt_tuning import PromptTuning
 
 """
@@ -257,6 +258,11 @@ if __name__ == "__main__":
     model, tokenizer = mlx_lm_load_model(args.model)
     model.value_head = nn.Linear(model.args.hidden_size, 1)
 
+    if args.quantize:
+        q_group_size = 64
+        q_bits = 4
+        weights, _ = quantize_model(model, {}, q_group_size, q_bits)
+
     if args.resume_file is not None:
         print(f"Loading pretrained weights from {args.resume_file}")
         model.load_weights(args.resume_file, strict=False)
@@ -317,7 +323,3 @@ if __name__ == "__main__":
         test_ppl = math.exp(test_loss)
 
         print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
-
-    if args.prompt is not None:
-        print("Generating")
-        utils.generate(model, args.prompt, tokenizer, args)
