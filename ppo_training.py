@@ -18,8 +18,8 @@
 Example call to use a pre-trained soft-prompt model from sft.py for RLHF with ground-truth reward:
 python ppo_training.py --log_with=wandb --prompt_tuning --resume_file prompt_weights.npz --num_prompt_tokens 10 --model ../tiny_llama --ground_truth_reward
 
-Example call to use a pre-trained LoRA from sft for RLHF with ground-truth reward:
-python ppo_training.py --log_with=wandb --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --resume_file even_digit_fine_tune.npz --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --ground_truth_reward --num_steps 5550 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 7
+Example call to use a pre-trained digit fine-tune for RLHF with ground-truth reward:
+python ppo_training.py --log_with=wandb --model andrewsilva/increasing_digit_fine_tune --batch_size 32 --mini_batch_size 32 --ppo_epoch 4 --ground_truth_reward --num_steps 5550 --adap_kl_ctrl True --init_kl_coef 0.2 --seed 7
 
 Example call to try LoRA without SFT for RLHF with a learned reward model (located at `../reward_model`):
 python ppo_training.py --log_with=wandb --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --reward_model ../reward_model/
@@ -29,12 +29,11 @@ from typing import Optional
 import random
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from tqdm import tqdm
 from transformers import HfArgumentParser
 
-from utils import linear_to_lora_layers
+from utils import get_model_and_tokenizer
 
 from mlx.utils import tree_flatten
 from mlx_ppo_trainer import PPOTrainer
@@ -43,7 +42,6 @@ from data.data_utils import get_all_txts
 import utils
 
 from models.config import PPOConfig
-from models.prompt_tuning import PromptTuning
 
 
 def collator(data):
@@ -60,44 +58,12 @@ def main(args_in, ppo_config_in):
         ref_model, _, _ = utils.load(args_in.model)
         device_map = None
         peft_config = None
+        if args_in.resume_file is not None:
+            ref_model.load_weights(args_in.resume_file, strict=False)
     else:
         ref_model = None
 
-    print("Loading pretrained model")
-    model, tokenizer, _ = utils.load(args_in.model)
-
-    if args.resume_file is not None:
-        print(f"Loading pretrained weights from {args.resume_file}")
-        model.load_weights(args.resume_file, strict=False)
-
-    # Freeze all layers other than PEFT weights
-    model.freeze()
-    model.value_head.unfreeze()
-    if args.prompt_tuning:
-        model = PromptTuning(num_tokens=args.num_prompt_tokens, model=model)
-    else:
-        lora_parameters = {"rank": 16, "alpha": 16, "dropout": 0.1, "scale": 10.0}
-
-        linear_to_lora_layers(
-            model, args.lora_layers, lora_parameters, use_dora=False
-        )
-
-    if args_in.resume_file is not None:
-        print(f"Loading pretrained weights from {args_in.resume_file}")
-        model.load_weights(args_in.resume_file, strict=False)
-        if ref_model is not None:
-            ref_model.load_weights(args_in.resume_file, strict=False)
-
-    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10 ** 6
-    print(f"Total parameters {p:.3f}M")
-    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10 ** 6
-    print(f"Trainable parameters {p:.3f}M")
-
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'left'
-        # tokenizer._tokenizer.padding_side = 'left'
+    model, tokenizer = get_model_and_tokenizer(args_in, need_generate=True)
 
     # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
     ppo_trainer = PPOTrainer(ppo_config_in, model, ref_model, tokenizer, data_collator=collator)
@@ -198,7 +164,7 @@ if __name__ == "__main__":
         prompt_tuning: bool = field(default=False, metadata={"help": "whether to use prompt-tuning or LoRA"})
         me_chatbot: bool = field(default=False, metadata={'help': 'Set prompts as samples from my imessage history?'})
         num_steps: Optional[int] = field(default=5550, metadata={'help': 'How many PPO training iterations should we use?'})
-
+        quantize: bool = field(default=False, metadata={'help': 'Should we quantize our model?'})
 
     parser = HfArgumentParser((ScriptArguments, PPOConfig))
     args, ppo_config = parser.parse_args_into_dataclasses()

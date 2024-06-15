@@ -47,9 +47,7 @@ EPS = 1e-6
 # Running TO-DO list:
 # 1. Log/save model with highest reward
 # 2. Add some kind of entropy reward?
-# 3. Incorporate kl-rewards (currently set to 0.0)
-# 4. Gradient clipping
-# 5. Ignore batch if the average ratio is too high
+# 3. Gradient clipping
 
 
 class PPOTrainer:
