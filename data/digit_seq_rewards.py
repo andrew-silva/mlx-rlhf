@@ -92,7 +92,6 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
         sequence_length = random.randint(*sequence_length_range)
         if reward_function.is_increasing:
             start_range = (0, 200)
-
         else:
             start_range = (100, 1000)
 
@@ -101,24 +100,82 @@ def generate_synthetic_data(reward_function, num_samples=100, sequence_length_ra
         sequence = [first_digit]
         for _ in range(sequence_length):
             # Bias the generation towards high-reward samples
-            if random.random() < (1-percent_noise):
-                # Generate a digit that matches the pattern
-                if reward_function.is_increasing:
-                    digit = random.randint(sequence[-1], sequence[-1] + 50)
-                    digit += (reward_function.multiple_of - digit % reward_function.multiple_of)
-                elif reward_function.is_decreasing:
-                    digit = random.randint(sequence[-1] - 10, sequence[-1])
-                    digit -= digit % reward_function.multiple_of
-                else:
-                    digit = random.randint(-100, 100)
-            else:
-                digit = random.randint(-100, 100)
-
+            digit = sample_digit(reward_function, noise_level=percent_noise, sequence=sequence, prompt=first_digit)
             sequence.append(digit)
 
         input_str = ' '.join(map(str, sequence))
 
         synthetic_data.append(input_str)
+
+    return synthetic_data
+
+
+def sample_digit(reward_function, noise_level, sequence, prompt):
+    """
+    Get the next digit in a sequence using the provided reward function
+    """
+    if len(sequence) == 0:
+        prev_digit = prompt
+    else:
+        prev_digit = sequence[-1]
+    if random.random() < (1 - noise_level):
+        # Generate a digit that matches the pattern
+        if reward_function.is_increasing:
+            digit = random.randint(prev_digit, prev_digit + 50)
+            digit += (reward_function.multiple_of - digit % reward_function.multiple_of)
+        elif reward_function.is_decreasing:
+            digit = random.randint(prev_digit - 10, prev_digit)
+            digit -= digit % reward_function.multiple_of
+        else:
+            digit = random.randint(-100, 100)
+    else:
+        digit = random.randint(-100, 100)
+
+    return digit
+
+
+def generate_dpo_synthetic_data(reward_function, num_samples=100, sequence_length_range=(5, 15),
+                                chosen_noise=0.0, rejected_noise=0.5):
+    """
+    Generates synthetic data according to the provided reward function for DPO
+    *** NOTE *** This currently ignores positive/negative.
+    Args:
+        reward_function: The reward function to use as our guide for what constitutes a valid sequence
+        num_samples: How many samples should we generate/return?
+        sequence_length_range: What length-range would you like to sample from?
+        chosen_noise: What percent of sampled digits should be noisy/incorrect for chosen samples (suggest 0.0)?
+        rejected_noise: What percent of sampled digits should be noisy/incorrect for rejected samples (suggest >= 0.5)?
+    """
+    synthetic_data = []
+
+    for _ in range(num_samples):
+        sequence_length = random.randint(*sequence_length_range)
+        if reward_function.is_increasing:
+            start_range = (0, 200)
+
+        else:
+            start_range = (100, 1000)
+
+        first_digit = random.randint(*start_range)
+        first_digit += (reward_function.multiple_of - first_digit % reward_function.multiple_of)
+        prompt = first_digit
+        chosen = []
+        rejected = []
+        for _ in range(sequence_length):
+            # Bias the generation towards high-reward samples
+            next_chosen = sample_digit(reward_function, noise_level=chosen_noise, sequence=chosen, prompt=prompt)
+            next_rejected = sample_digit(reward_function, noise_level=rejected_noise, sequence=rejected, prompt=prompt)
+            chosen.append(next_chosen)
+            rejected.append(next_rejected)
+
+        # Turn each sequence into a string
+        chosen_str = ' '.join(map(str, chosen))
+        rejected_str = ' '.join(map(str, rejected))
+        chosen_str = f'{prompt} {chosen_str}'
+        rejected_str = f'{prompt} {rejected_str}'
+
+        # Return triplet of {prompt, chosen, rejected}
+        synthetic_data.append([str(prompt), chosen_str, rejected_str])
 
     return synthetic_data
 
@@ -133,3 +190,11 @@ if __name__ == "__main__":
                                        sequence_length_range=(5, 10))
     for seq in gen_data:
         print(f'String: {seq} reward: {reward_fn(seq)}')
+
+    gen_dpo_data = generate_dpo_synthetic_data(reward_function=reward_fn,
+                                               num_samples=10,
+                                               sequence_length_range=(5, 10),
+                                               chosen_noise=0.0,
+                                               rejected_noise=0.5)
+    for seq in gen_dpo_data:
+        print(f'Prompt: {seq[0]}  || Chosen: {seq[1]} || Rejected {seq[2]}')
