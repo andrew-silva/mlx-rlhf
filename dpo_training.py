@@ -16,7 +16,7 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten
 
 from utils import generate_ids, get_model_and_tokenizer
-from sft import iterate_batches, save_adapter
+from sft import save_adapter
 from data.data_utils import build_parser
 
 
@@ -32,9 +32,8 @@ class DPODataset:
                  ):
         """
         Args:
+            entries: triples of {'prompt': <>, 'chosen': <>, 'rejected':<>}
             tokenizer: Tokenizer to use.
-            dataset_path: Path to dataset file.
-            key: Key to use for text.
             max_length: Max token length per training entry.
         """
         self._type_id = "DPO"
@@ -64,6 +63,12 @@ class DPODataset:
 
         if num_outsized > 0:
             print(f"Removed {num_outsized} entries from dataset due to max. length {max_length}")
+
+    def __len__(self):
+        return len(self._data)
+
+    def __getitem__(self, idx: int):
+        return self._data[idx]
 
     def iterate_batches(self,
                         batch_size: int,
@@ -210,7 +215,6 @@ class TrainableDPO:
         Returns:
             Loss value.
         """
-
         def forward(model, x, mask):
             inputs = x[:, :-1]
             targets = x[:, 1:]
@@ -280,8 +284,7 @@ class TrainableDPO:
     def evaluate(self, dataset, batch_size):
         all_losses = []
         ntokens = 0
-        for batch in iterate_batches(dataset, self.tokenizer, batch_size,
-                                     reward_modeling=False, chat_data=self.chat_data):
+        for batch in dataset.iterate_batches(batch_size, train_mode=False):
             losses, _, toks = self.loss(*batch)
             all_losses.append(losses.item())
             ntokens += toks.item()
@@ -299,7 +302,6 @@ class TrainableDPO:
               learning_rate: float = 1e-5,
               compiled_step: bool = True,
               grad_checkpoint: bool = False,
-              epochs: int = 1,
               iterations: int = 0,
               validation_samples: int = 40
               ):
@@ -310,17 +312,13 @@ class TrainableDPO:
             dataset_validation: Validation dataset.
             batch_size: Batch size.
             learning_rate: Learning rate.
-            epochs: Number of epochs.
             iterations: Number of iterations.
             validation_samples: Number of validation samples.
         """
         # Calculate number of iterations
         if iterations == 0:
             iterations = len(dataset_training) // batch_size
-
-        # Calculate number of validation batches
-        validation_batches = validation_samples // batch_size
-        print(f"Training the model for {epochs} epochs of {iterations} batch iterations with batch size {batch_size}")
+        print(f"Training the model for {iterations} iterations with batch size {batch_size}")
         print(f"Training learning rate: {learning_rate}")
 
         optimizer = optim.Adam(learning_rate=learning_rate)
@@ -350,58 +348,71 @@ class TrainableDPO:
                 return loss_value, reward, num_tokens
 
         losses = []
-        for epoch in range(epochs):
-            for it, batch in zip(range(iterations), dataset_training.iterate_batches(
-                                                                    batch_size=batch_size,
-                                                                    train_mode=True)):
-                s_t = time.perf_counter()
-                if compiled_step:
-                    loss_value, reward, num_tokens = step(batch)
-                else:
-                    (loss_value, reward, num_tokens), grad = loss_value_and_grad(*batch)
-                    optimizer.update(self.model, grad)
-
-                if it % self.args.save_every == 0:
-                    save_adapter(model, self.args.save_file)
-                    checkpoint = (
-                            Path(self.args.save_file).parent / f"{it:07d}_adapters.safetensors"
+        for it, batch in zip(range(iterations), dataset_training.iterate_batches(
+                                                                batch_size=batch_size,
+                                                                train_mode=True)):
+            s_t = time.perf_counter()
+            if compiled_step:
+                loss_value, reward, num_tokens = step(batch)
+            else:
+                (loss_value, reward, num_tokens), grad = loss_value_and_grad(*batch)
+                optimizer.update(self.model, grad)
+            # Backward step
+            mx.eval(loss_value, reward, num_tokens)
+            # Record loss and number of tokens
+            losses.append(loss_value.item())
+            chosen_reward = reward[0].item()
+            reference_reward = reward[1].item()
+            # Log metrics to W&B
+            self.logger.log({
+                'loss': loss_value.item(),
+                'policy_reward': chosen_reward,
+                'reference_reward': reference_reward,
+                'tokens_per_sec': num_tokens.item() / (time.perf_counter() - s_t)
+            })
+            # Perform evaluation every steps_per_eval iterations
+            if it % self.args.steps_per_eval == 0:
+                # Get validation loss
+                val_loss = self.evaluate(dataset_validation, batch_size)
+                self.logger.log({'val_loss': val_loss})  # Log loss
+                # Write out some example generations:
+                for prompt_tokens in [2, 20, 200]:
+                    policy_completion = generate_ids(
+                        model=self.model,
+                        input_ids=[self.tokenizer(f'{prompt_tokens}')['input_ids']],
+                        temperature=0,
+                        max_tokens=12
                     )
-                    save_adapter(self.model, checkpoint)
+                    print(f'Prompt: {prompt_tokens} || Completion: {self.tokenizer.decode(policy_completion[0].tolist())}')
 
-                mx.eval(loss_value, reward, num_tokens)
-
-                # Record loss and number of tokens
-                losses.append(loss_value.item())
-
-                self.logger.log({
-                    'loss': loss_value.item(),
-                    'reward': reward,
-                    'tokens_per_sec': num_tokens / (time.perf_counter() - s_t)
-                })
-                # Report validation loss if needed
-            val_loss = self.evaluate(dataset_validation, batch_size)
-            self.logger.log({'val_loss': val_loss.items()})
+            # Save the model/adapter every save_every steps
+            if it % self.args.save_every == 0:
+                save_adapter(self.model, self.args.save_file)
+                checkpoint = (
+                        Path(self.args.save_file).parent / f"{it:07d}_adapters.safetensors"
+                )
+                save_adapter(self.model, checkpoint)
 
 
 if __name__ == "__main__":
     parser = build_parser()
-    args = parser.parse_args()
+    training_args = parser.parse_args()
 
-    np.random.seed(args.seed)
+    np.random.seed(training_args.seed)
 
-    model, tokenizer = get_model_and_tokenizer(args, need_generate=True, add_peft=True)
+    training_model, training_tokenizer = get_model_and_tokenizer(training_args, need_generate=True, add_peft=True)
     print("Loading datasets")
-    with open(Path(args.data) / f"{args.data_base}train.jsonl", "r") as fid:
+    with open(Path(training_args.data) / f"{training_args.data_base}train.jsonl", "r") as fid:
         entries = [json.loads(l) for l in fid]
-        train_set = DPODataset(entries, tokenizer)
-    with open(Path(args.data) / f"{args.data_base}valid.jsonl", "r") as fid:
+        train_set = DPODataset(entries, training_tokenizer)
+    with open(Path(training_args.data) / f"{training_args.data_base}valid.jsonl", "r") as fid:
         entries = [json.loads(l) for l in fid]
-        valid_set = DPODataset(entries, tokenizer)
+        valid_set = DPODataset(entries, training_tokenizer)
 
     trainer = TrainableDPO(
-        model=model,
-        tokenizer=tokenizer,
-        args=args,
+        model=training_model,
+        tokenizer=training_tokenizer,
+        args=training_args,
         reference_free=False,
         loss_type="sigmoid",
         loss_beta=0.1,
@@ -411,13 +422,12 @@ if __name__ == "__main__":
     trainer.train(
         dataset_training=train_set,
         dataset_validation=valid_set,
-        batch_size=args.batch_size,
+        batch_size=training_args.batch_size,
         learning_rate=1e-4,
         compiled_step=True,
         grad_checkpoint=False,
-        epochs=1,
-        iterations=args.iters
+        iterations=training_args.iters
     )
 
     # Save weights
-    mx.savez(args.save_file, **dict(tree_flatten(model.trainable_parameters())))
+    mx.savez(training_args.save_file, **dict(tree_flatten(training_model.trainable_parameters())))

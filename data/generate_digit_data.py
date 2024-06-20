@@ -10,7 +10,7 @@ To generate reward model data:
 python generate_digit_data.py --increasing --multiple-of 2 --num-samples 150 --noise 0.2
 
 To generate DPO data: (adds 0 noise to chosen and 0.5 noise to rejected)
-python generate_digit_data.py --increasing --multiple-of 2 --num-samples 150 --dpo --noise 0.5
+python generate_digit_data.py --increasing --multiple-of 2 --num-samples 15000 --dpo --noise 0.8
 
 """
 def build_data_gen_parser():
