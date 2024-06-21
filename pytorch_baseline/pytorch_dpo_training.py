@@ -1,23 +1,23 @@
 """
 
-python dpo_training.py --model andrewsilva/increasing_digit_fine_tune --data ./data --data-base increasing_mult_2_DPO_ --batch-size 32 --iters 5550 --seed 7
+python pytorch_dpo_training.py --model andrewsilva/increasing_digit_fine_tune --data ./data --data-base increasing_mult_2_DPO_ --batch-size 32 --iters 5550 --seed 7
 
 """
 import time
 import wandb
-import numpy as np
 from pathlib import Path
-from functools import partial
 import json
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
-from mlx.utils import tree_flatten
-
-from utils import generate_ids, get_model_and_tokenizer
-from sft import save_adapter
+from utils import generate_ids
 from data.data_utils import build_parser
+
+
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import torch
+from peft import LoraConfig, get_peft_model
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 class DPODataset:
@@ -99,19 +99,19 @@ class DPODataset:
                     rejected[j, : rejected_lengths[j]] = batch[j][2]
 
                 # Mask prompt and padding tokens
-                chosen_lengths = mx.array(chosen_lengths)
-                rejected_lengths = mx.array(rejected_lengths)
-                prompt_lengths = mx.array([len(x[0]) for x in batch])
-                chosen_masks = mx.logical_and(
-                    mx.arange(chosen.shape[1] - 1)[None, :] < chosen_lengths[:, None] - 1,
-                    mx.arange(chosen.shape[1] - 1)[None, :] >= prompt_lengths[:, None]
+                chosen_lengths = torch.tensor(chosen_lengths)
+                rejected_lengths = torch.tensor(rejected_lengths)
+                prompt_lengths = torch.tensor([len(x[0]) for x in batch])
+                chosen_masks = torch.logical_and(
+                    torch.arange(chosen.shape[1] - 1)[None, :] < chosen_lengths[:, None] - 1,
+                    torch.arange(chosen.shape[1] - 1)[None, :] >= prompt_lengths[:, None]
                 )
-                rejected_masks = mx.logical_and(
-                    mx.arange(rejected.shape[1] - 1)[None, :] < rejected_lengths[:, None] - 1,
-                    mx.arange(rejected.shape[1] - 1)[None, :] >= prompt_lengths[:, None]
+                rejected_masks = torch.logical_and(
+                    torch.arange(rejected.shape[1] - 1)[None, :] < rejected_lengths[:, None] - 1,
+                    torch.arange(rejected.shape[1] - 1)[None, :] >= prompt_lengths[:, None]
                 )
 
-                yield mx.array(chosen), mx.array(rejected), chosen_masks, rejected_masks
+                yield torch.tensor(chosen), torch.tensor(rejected), chosen_masks, rejected_masks
 
             if not train_mode:
                 break
@@ -130,7 +130,8 @@ class TrainableDPO:
                  reference_free: bool = False,
                  loss_type: str = "sigmoid",
                  loss_beta: float = 0.1,
-                 label_smoothing: float = 0.0
+                 label_smoothing: float = 0.0,
+                 device='cpu'
                  ):
         """
         Args:
@@ -147,6 +148,7 @@ class TrainableDPO:
         self.tokenizer = tokenizer
         self.args = args
         self.chat_data = 'chat' in self.args.data_base
+        self.device = device
         self.logger = wandb.init(
             project='RLAIF',
             config=args,
@@ -156,11 +158,9 @@ class TrainableDPO:
         if reference_free:
             self.reference = None
         else:
-            self.reference, _ = get_model_and_tokenizer(args, need_generate=True, add_peft=False)
-            weights = self.model.parameters()
-            self.reference.update(weights)
-            self.reference.freeze()
-            self.reference.train(mode=False)
+            self.reference = AutoModelForCausalLM.from_pretrained(args.model)
+            self.reference.eval()
+            self.reference.to(self.device)
 
     def comparison(self,
                    prompt: str,
@@ -200,10 +200,10 @@ class TrainableDPO:
     # https://huggingface.co/docs/trl/main/en/dpo_trainer
     ########
     def loss(self,
-             chosen: mx.array,
-             rejected: mx.array,
-             chosen_masks: mx.array,
-             rejected_masks: mx.array,
+             chosen: torch.tensor,
+             rejected: torch.tensor,
+             chosen_masks: torch.tensor,
+             rejected_masks: torch.tensor,
              ):
         """
         Calculate loss for inputs.
@@ -215,14 +215,15 @@ class TrainableDPO:
         Returns:
             Loss value.
         """
+        ce_loss = nn.CrossEntropyLoss(reduction='none')
         def forward(model, x, mask):
             inputs = x[:, :-1]
             targets = x[:, 1:]
-
-            logits, _, _ = model(inputs)
-            # logits = logits.astype(mx.float32)
-
-            return -nn.losses.cross_entropy(logits, targets) * mask
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device)
+            mask = mask.to(self.device)
+            output = model(inputs)
+            return -ce_loss(output.logits.reshape(-1, output.logits.size(-1)), targets.reshape(-1).to(dtype=torch.long)) * mask.reshape(-1)
 
         num_chosen_tokens = chosen_masks.sum(-1)
         num_rejected_tokens = rejected_masks.sum(-1)
@@ -240,11 +241,11 @@ class TrainableDPO:
 
         # Calculate log probabilities for reference model
         if self.reference_free:
-            reference_chosen_score = mx.zeros_like(policy_chosen_score)
-            reference_rejected_score = mx.zeros_like(policy_rejected_score)
+            reference_chosen_score = torch.zeros_like(policy_chosen_score)
+            reference_rejected_score = torch.zeros_like(policy_rejected_score)
         else:
-            reference_chosen_scores = mx.stop_gradient(forward(self.reference, chosen, chosen_masks))
-            reference_rejected_scores = mx.stop_gradient(forward(self.reference, rejected, rejected_masks))
+            reference_chosen_scores = forward(self.reference, chosen, chosen_masks).detach()
+            reference_rejected_scores = forward(self.reference, rejected, rejected_masks).detach()
             if self.loss_type == "ipo":
                 # ipo uses average log probabilities
                 reference_chosen_score = reference_chosen_scores.sum(-1) / num_chosen_tokens
@@ -257,27 +258,27 @@ class TrainableDPO:
 
         if self.loss_type == "sigmoid":
             # https://arxiv.org/abs/2305.18290
-            losses = -nn.log_sigmoid(self.beta * logits)
+            losses = -nn.functional.logsigmoid(self.beta * logits)
         elif self.loss_type == "hinge":
             # https://arxiv.org/abs/2309.06657
-            losses = nn.relu(1 - self.beta * logits)
+            losses = nn.functional.relu(1 - self.beta * logits)
         elif self.loss_type == "ipo":
             # https://arxiv.org/abs/2310.12036
             losses = (logits - 1 / (2 * self.beta)) ** 2
         elif self.loss_type == "dpop":
             # https://arxiv.org/abs/2402.13228v1
             self.delta = 50
-            penalty = mx.maximum(mx.zeros_like(policy_chosen_score), reference_chosen_score - policy_chosen_score)
-            losses = -(nn.log_sigmoid(self.beta * logits) - self.delta * penalty)
+            penalty = torch.maximum(torch.zeros_like(policy_chosen_score), reference_chosen_score - policy_chosen_score)
+            losses = -(nn.functional.logsigmoid(self.beta * logits) - self.delta * penalty)
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
-        loss = mx.mean(losses)
+        loss = torch.mean(losses)
         num_tokens = (num_chosen_tokens + num_rejected_tokens).sum()
 
-        chosen_reward = self.beta * mx.mean(policy_chosen_score - reference_chosen_score)
-        rejected_reward = self.beta * mx.mean(policy_rejected_score - reference_rejected_score)
-        reward = mx.stack([chosen_reward, rejected_reward])
+        chosen_reward = self.beta * torch.mean(policy_chosen_score - reference_chosen_score)
+        rejected_reward = self.beta * torch.mean(policy_rejected_score - reference_rejected_score)
+        reward = torch.stack([chosen_reward.cpu(), rejected_reward.cpu()])
 
         return loss, reward, num_tokens
 
@@ -300,10 +301,7 @@ class TrainableDPO:
               dataset_validation,
               batch_size: int = 4,
               learning_rate: float = 1e-5,
-              compiled_step: bool = True,
-              grad_checkpoint: bool = False,
               iterations: int = 0,
-              validation_samples: int = 40
               ):
         """
         Train model.
@@ -313,7 +311,6 @@ class TrainableDPO:
             batch_size: Batch size.
             learning_rate: Learning rate.
             iterations: Number of iterations.
-            validation_samples: Number of validation samples.
         """
         # Calculate number of iterations
         if iterations == 0:
@@ -321,51 +318,25 @@ class TrainableDPO:
         print(f"Training the model for {iterations} iterations with batch size {batch_size}")
         print(f"Training learning rate: {learning_rate}")
 
-        optimizer = optim.Adam(learning_rate=learning_rate)
-
-        if grad_checkpoint:
-            print(f"Enabled gradient checkpointing")
-
-            if not compiled_step:
-                print(f"Gradient checkpointing requires compiled step function")
-                compiled_step = True
-
-            for layer in self.model.layers:
-                layer.forward = nn.utils.checkpoint(layer, layer.forward)
-
-        # Create value and gradient function for loss
-        loss_value_and_grad = nn.value_and_grad(self.model, self.loss)
-
-        if compiled_step:
-            state = [self.model.state, optimizer.state]
-
-            # Step function for forward and backward pass
-            @partial(mx.compile, inputs=state, outputs=state)
-            def step(batch):
-                (loss_value, reward, num_tokens), grad = loss_value_and_grad(*batch)
-                optimizer.update(self.model, grad)
-
-                return loss_value, reward, num_tokens
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
         losses = []
         for it, batch in zip(range(iterations), dataset_training.iterate_batches(
                                                                 batch_size=batch_size,
                                                                 train_mode=True)):
             s_t = time.perf_counter()
-            if compiled_step:
-                loss_value, reward, num_tokens = step(batch)
-            else:
-                (loss_value, reward, num_tokens), grad = loss_value_and_grad(*batch)
-                optimizer.update(self.model, grad)
+            optimizer.zero_grad()
+            loss, reward, num_tokens = self.loss(*batch)
             # Backward step
-            mx.eval(loss_value, reward, num_tokens)
+            loss.backward()
+            optimizer.step()
             # Record loss and number of tokens
-            losses.append(loss_value.item())
+            losses.append(loss.item())
             chosen_reward = reward[0].item()
             reference_reward = reward[1].item()
             # Log metrics to W&B
             self.logger.log({
-                'loss': loss_value.item(),
+                'loss': loss.item(),
                 'policy_reward': chosen_reward,
                 'reference_reward': reference_reward,
                 'tokens_per_sec': num_tokens.item() / (time.perf_counter() - s_t)
@@ -385,22 +356,32 @@ class TrainableDPO:
                     )
                     print(f'Prompt: {prompt_tokens} || Completion: {self.tokenizer.decode(policy_completion[0].tolist())}')
 
-            # Save the model/adapter every save_every steps
-            if it % self.args.save_every == 0:
-                save_adapter(self.model, self.args.save_file)
-                checkpoint = (
-                        Path(self.args.save_file).parent / f"{it:07d}_adapters.safetensors"
-                )
-                save_adapter(self.model, checkpoint)
-
 
 if __name__ == "__main__":
     parser = build_parser()
     training_args = parser.parse_args()
 
     np.random.seed(training_args.seed)
+    DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    training_model, training_tokenizer = get_model_and_tokenizer(training_args, need_generate=True, add_peft=True)
+    training_tokenizer = AutoTokenizer.from_pretrained(training_args.tokenizer if training_args.tokenizer is not None else training_args.model)
+    training_model = AutoModelForCausalLM.from_pretrained(training_args.model)
+
+    if training_tokenizer.pad_token_id is None:
+        training_tokenizer.pad_token_id = training_tokenizer.eos_token_id
+        training_tokenizer.pad_token = training_tokenizer.eos_token
+
+    config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=16,
+        lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],  # ['query_key_value'],  #
+        lora_dropout=0.01,
+    )
+    model = get_peft_model(training_model, config)
+    model.to(DEVICE)
+
+
     print("Loading datasets")
     with open(Path(training_args.data) / f"{training_args.data_base}train.jsonl", "r") as fid:
         entries = [json.loads(l) for l in fid]
@@ -416,7 +397,8 @@ if __name__ == "__main__":
         reference_free=False,
         loss_type="sigmoid",
         loss_beta=0.1,
-        label_smoothing=0.0
+        label_smoothing=0.0,
+        device=DEVICE
     )
     # Train model
     trainer.train(
@@ -424,10 +406,7 @@ if __name__ == "__main__":
         dataset_validation=valid_set,
         batch_size=training_args.batch_size,
         learning_rate=1e-4,
-        compiled_step=True,
-        grad_checkpoint=False,
         iterations=training_args.iters
     )
 
-    # Save weights
-    mx.savez(training_args.save_file, **dict(tree_flatten(training_model.trainable_parameters())))
+    training_model.save_pretrained(training_args.save_file)
